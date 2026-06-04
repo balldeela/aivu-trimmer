@@ -200,6 +200,8 @@ class AivuTrimmerApp(NSObject):
         self._out_label = None
         self._play_btn = None
         self._export_btn = None
+        self._sbs_btn = None
+        self._status_label = None
         self._progress = None
         self._zoom = 1.0
         return self
@@ -229,15 +231,15 @@ class AivuTrimmerApp(NSObject):
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(100, 100, 900, 620), style, NSBackingStoreBuffered, False,
+            NSMakeRect(100, 100, 1000, 620), style, NSBackingStoreBuffered, False,
         )
         win.setTitle_("AIVU Trimmer")
-        win.setMinSize_((700, 500))
+        win.setMinSize_((860, 500))
         c = win.contentView()
 
         # Player view — grows with the window (width + height flexible),
         # bottom edge pinned at y=160 so it never overlaps the timeline.
-        pv = AVPlayerView.alloc().initWithFrame_(NSMakeRect(0, 160, 900, 420))
+        pv = AVPlayerView.alloc().initWithFrame_(NSMakeRect(0, 160, 1000, 420))
         pv.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         pv.setControlsStyle_(0)
         pv.setWantsLayer_(True)
@@ -247,7 +249,7 @@ class AivuTrimmerApp(NSObject):
 
         # Timeline — fixed height, pinned a fixed distance above the bottom
         # controls (flexible TOP margin so the gap above it absorbs resizing).
-        tv = TimelineView.alloc().initWithFrame_(NSMakeRect(0, 110, 900, 50))
+        tv = TimelineView.alloc().initWithFrame_(NSMakeRect(0, 110, 1000, 50))
         tv.setup(self)
         tv.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
         c.addSubview_(tv)
@@ -284,21 +286,25 @@ class AivuTrimmerApp(NSObject):
         self._out_label = out_lbl
 
         # Zoom controls (right side of the label row, tracks right edge)
-        zout = self.addButton_title_rect_action_(c, "Zoom −", NSMakeRect(700, 74, 60, 30), "zoomOut:")
-        zin  = self.addButton_title_rect_action_(c, "Zoom +", NSMakeRect(763, 74, 60, 30), "zoomIn:")
-        zfit = self.addButton_title_rect_action_(c, "Fit",    NSMakeRect(826, 74, 54, 30), "zoomReset:")
+        zout = self.addButton_title_rect_action_(c, "Zoom −", NSMakeRect(800, 74, 60, 30), "zoomOut:")
+        zin  = self.addButton_title_rect_action_(c, "Zoom +", NSMakeRect(863, 74, 60, 30), "zoomIn:")
+        zfit = self.addButton_title_rect_action_(c, "Fit",    NSMakeRect(926, 74, 54, 30), "zoomReset:")
         for b in (zout, zin, zfit):
             b.setAutoresizingMask_(NSViewMinXMargin)  # stick to right edge
 
         # Buttons row
-        self.addButton_title_rect_action_(c, "▶  Play",        NSMakeRect(10,  35, 100, 32), "togglePlayPause:")
-        self.addButton_title_rect_action_(c, "🟡 Set In",       NSMakeRect(120, 35, 110, 32), "setInPoint:")
-        self.addButton_title_rect_action_(c, "🔴 Set Out",      NSMakeRect(240, 35, 110, 32), "setOutPoint:")
-        self.addButton_title_rect_action_(c, "Open…",           NSMakeRect(360, 35, 90,  32), "openFile:")
+        self.addButton_title_rect_action_(c, "▶  Play",  NSMakeRect(10,  35, 80, 32), "togglePlayPause:")
+        self.addButton_title_rect_action_(c, "🟡 Set In",  NSMakeRect(98,  35, 92, 32), "setInPoint:")
+        self.addButton_title_rect_action_(c, "🔴 Set Out", NSMakeRect(198, 35, 98, 32), "setOutPoint:")
+        self.addButton_title_rect_action_(c, "Open…",     NSMakeRect(304, 35, 70, 32), "openFile:")
 
-        exp_btn = self.addButton_title_rect_action_(c, "Export Trimmed…", NSMakeRect(460, 35, 160, 32), "exportTrimmed:")
+        exp_btn = self.addButton_title_rect_action_(c, "Export .aivu…", NSMakeRect(382, 35, 150, 32), "exportTrimmed:")
         exp_btn.setEnabled_(False)
         self._export_btn = exp_btn
+
+        sbs_btn = self.addButton_title_rect_action_(c, "Export SBS MP4 (Quest)…", NSMakeRect(540, 35, 210, 32), "exportSBS:")
+        sbs_btn.setEnabled_(False)
+        self._sbs_btn = sbs_btn
 
         # Keep a ref to play button to update its title
         for sub in c.subviews():
@@ -306,11 +312,20 @@ class AivuTrimmerApp(NSObject):
                 self._play_btn = sub
                 break
 
-        # Progress bar
-        prog = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(630, 40, 250, 20))
+        # Status label (shows export progress text)
+        status = self.makeTextField_rect_font_color_(
+            "", NSMakeRect(10, 8, 700, 18),
+            NSFont.systemFontOfSize_(11), NSColor.lightGrayColor(),
+        )
+        c.addSubview_(status)
+        self._status_label = status
+
+        # Progress bar (own row along the bottom)
+        prog = NSProgressIndicator.alloc().initWithFrame_(NSMakeRect(720, 7, 270, 18))
         prog.setStyle_(NSProgressIndicatorStyleBar)
         prog.setIndeterminate_(True)
         prog.setHidden_(True)
+        prog.setAutoresizingMask_(NSViewMinXMargin)
         c.addSubview_(prog)
         self._progress = prog
 
@@ -390,6 +405,7 @@ class AivuTrimmerApp(NSObject):
             self.refreshLabels()
             self._timeline_view.setNeedsDisplay_(True)
             self._export_btn.setEnabled_(True)
+            self._sbs_btn.setEnabled_(True)
 
         threading.Thread(target=poll_duration, daemon=True).start()
 
@@ -520,9 +536,7 @@ class AivuTrimmerApp(NSObject):
         self.runExport_start_duration_(out_path, self._in_point, trim_dur)
 
     def runExport_start_duration_(self, out_path, start, duration):
-        self._export_btn.setEnabled_(False)
-        self._progress.setHidden_(False)
-        self._progress.startAnimation_(None)
+        self._beginExportUI_("Exporting lossless .aivu…")
         src = self._source_path
 
         def do_export():
@@ -568,9 +582,7 @@ class AivuTrimmerApp(NSObject):
             ok, msg = result_box[0] if result_box[0] else (False, "Export timed out.")
 
             def finish():
-                self._progress.stopAnimation_(None)
-                self._progress.setHidden_(True)
-                self._export_btn.setEnabled_(True)
+                self._endExportUI()
                 if ok:
                     self.showAlert_message_("Export complete", f"Saved to:\n{out_path}")
                 else:
@@ -581,6 +593,129 @@ class AivuTrimmerApp(NSObject):
             )
 
         threading.Thread(target=do_export, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
+    #  Side-by-side MP4 export (Meta Quest 3 compatible)                   #
+    # ------------------------------------------------------------------ #
+
+    def exportSBS_(self, sender):
+        if not self._source_path:
+            return
+        trim_dur = self._out_point - self._in_point
+        if trim_dur <= 0:
+            self.showAlert_message_("Invalid range", "Out point must be after in point.")
+            return
+
+        ffmpeg = self.findFFmpeg()
+        if not ffmpeg:
+            self.showAlert_message_(
+                "FFmpeg not found",
+                "Side-by-side MP4 export needs FFmpeg (with the hevc_videotoolbox "
+                "encoder) on your PATH.\n\nInstall it with:\n"
+                "    conda install -c conda-forge ffmpeg\nor:\n"
+                "    brew install ffmpeg",
+            )
+            return
+
+        base, _ = os.path.splitext(self._source_path)
+        suggested = os.path.basename(base + "_SBS_60fps.mp4")
+
+        panel = NSSavePanel.savePanel()
+        panel.setAllowedFileTypes_(["mp4"])
+        panel.setNameFieldStringValue_(suggested)
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(os.path.dirname(self._source_path)))
+        if panel.runModal() != 1:
+            return
+
+        out_path = str(panel.URL().path())
+        self.runSBSExport_start_duration_ffmpeg_(out_path, self._in_point, trim_dur, ffmpeg)
+
+    def findFFmpeg(self):
+        import shutil
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+        # Common locations when launched from Finder (minimal PATH)
+        candidates = [
+            os.path.expanduser("~/miniconda3/bin/ffmpeg"),
+            os.path.expanduser("~/anaconda3/bin/ffmpeg"),
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+        ]
+        for c in candidates:
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+        return None
+
+    def runSBSExport_start_duration_ffmpeg_(self, out_path, start, duration, ffmpeg):
+        self._beginExportUI_("Exporting side-by-side MP4 (this can take a few minutes)…")
+        src = self._source_path
+
+        def do_export():
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+
+            # Decode both MV-HEVC eye views, place them side-by-side, scale to
+            # an 8K-wide frame (≤ Quest 3's HEVC decode limit), drop 90→60 fps
+            # without changing speed (the fps filter resamples by timestamp),
+            # and encode with Apple's hardware HEVC encoder.
+            cmd = [
+                ffmpeg, "-hide_banner", "-v", "error", "-y",
+                "-ss", f"{start:.6f}", "-t", f"{duration:.6f}",
+                "-i", src,
+                "-filter_complex",
+                "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840,fps=60[v]",
+                "-map", "[v]", "-map", "0:a:0?",
+                "-c:v", "hevc_videotoolbox", "-b:v", "60M", "-tag:v", "hvc1",
+                "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart",
+                out_path,
+            ]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                ok = result.returncode == 0 and os.path.exists(out_path)
+                msg = (result.stderr or result.stdout).strip() or "Done."
+            except subprocess.TimeoutExpired:
+                ok, msg = False, "Export timed out (over 60 minutes)."
+            except Exception as e:
+                ok, msg = False, str(e)
+
+            def finish():
+                self._endExportUI()
+                if ok:
+                    self.showAlert_message_(
+                        "SBS MP4 export complete",
+                        f"Saved 7680×3840 side-by-side HEVC at 60 fps to:\n{out_path}",
+                    )
+                else:
+                    self.showAlert_message_("SBS export failed", msg[-800:])
+
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "runCallback:", finish, False
+            )
+
+        threading.Thread(target=do_export, daemon=True).start()
+
+    # ------------------------------------------------------------------ #
+    #  Shared export-UI helpers                                            #
+    # ------------------------------------------------------------------ #
+
+    def _beginExportUI_(self, status_text):
+        self._export_btn.setEnabled_(False)
+        self._sbs_btn.setEnabled_(False)
+        self._status_label.setStringValue_(status_text)
+        self._progress.setHidden_(False)
+        self._progress.startAnimation_(None)
+
+    def _endExportUI(self):
+        self._progress.stopAnimation_(None)
+        self._progress.setHidden_(True)
+        self._status_label.setStringValue_("")
+        self._export_btn.setEnabled_(True)
+        self._sbs_btn.setEnabled_(True)
 
     def runCallback_(self, block):
         block()

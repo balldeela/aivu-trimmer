@@ -1,12 +1,16 @@
 # AIVU Trimmer
 
-A lightweight macOS tool for **lossless trimming of Apple Immersive Video (`.aivu`) files**.
+A lightweight macOS tool for **trimming Apple Immersive Video (`.aivu`) files** —
+with two export modes:
 
-Set in/out points on a visual player with a timecode display, then export a trimmed
-copy — without re-encoding the footage and while preserving the Apple-specific
-immersive metadata (AIME / VenueDescriptor / spatial audio).
+1. **Lossless `.aivu`** — a trimmed copy with no re-encoding, preserving the
+   Apple-specific immersive metadata (AIME / VenueDescriptor / spatial audio).
+2. **Side-by-side MP4 for Meta Quest 3** — a stereoscopic SBS H.265 clip at 60 fps,
+   ready to drop onto a Quest 3 and play in a VR video player.
 
-![timeline screenshot placeholder](docs/screenshot.png)
+Set in/out points on a visual player with a timecode display, then export.
+
+![AIVU Trimmer screenshot](docs/screenshot.png)
 
 ## Features
 
@@ -17,8 +21,11 @@ immersive metadata (AIME / VenueDescriptor / spatial audio).
 - **Sample-accurate scrubbing** (zero-tolerance seeking, no keyframe snapping)
 - **Scroll-wheel nudging** of the playhead (±1 second per tick)
 - **Zoom in/out** of the preview to inspect detail
-- **Lossless export** using `AVAssetExportSession` with passthrough — writes a real
-  `.aivu` that opens in Apple Immersive Video Utility
+- **Lossless `.aivu` export** using `AVAssetExportSession` with passthrough — writes
+  a real `.aivu` that opens in Apple Immersive Video Utility
+- **Side-by-side MP4 export** (Meta Quest 3): decodes both MV-HEVC eye views, packs
+  them side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and
+  encodes HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
 
 ## Requirements
 
@@ -27,6 +34,12 @@ immersive metadata (AIME / VenueDescriptor / spatial audio).
   exporting `.aivu` will fail.
 - **Python 3.10+**
 - The PyObjC frameworks listed in [`requirements.txt`](requirements.txt)
+- **FFmpeg** (only for the side-by-side MP4 export) with the `hevc_videotoolbox`
+  encoder — the standard macOS builds include it:
+  ```bash
+  conda install -c conda-forge ffmpeg     # or: brew install ffmpeg
+  ```
+  The lossless `.aivu` export does **not** need FFmpeg.
 
 ## Installation
 
@@ -39,14 +52,17 @@ python3 -m pip install -r requirements.txt
 ## Usage
 
 ```bash
-python3 aivu_trimmer.py
+python3 aivu_trimmer.py                 # opens a file picker
+python3 aivu_trimmer.py movie.aivu      # or open a file directly
 ```
 
 1. Pick an `.aivu` file when prompted (or use **Open…**).
 2. Scrub the timeline / use the scroll wheel to find your in point, press **Set In**
    (or drag the yellow bar).
 3. Find your out point, press **Set Out** (or drag the red bar).
-4. Press **Export Trimmed…** and choose where to save.
+4. Export:
+   - **Export .aivu…** for a lossless trimmed Apple Immersive Video, or
+   - **Export SBS MP4 (Quest)…** for a side-by-side stereo clip for Meta Quest 3.
 
 ### Controls
 
@@ -58,8 +74,10 @@ python3 aivu_trimmer.py
 | Seek | Click / drag on the timeline |
 | Nudge playhead ±1s | Scroll wheel over the timeline |
 | Zoom preview | **Zoom +** / **Zoom −** / **Fit** buttons |
+| Export lossless `.aivu` | **Export .aivu…** button |
+| Export side-by-side MP4 | **Export SBS MP4 (Quest)…** button |
 
-## How the lossless trim works
+## How the lossless `.aivu` trim works
 
 Export uses `AVAssetExportSession` with the **passthrough** preset and an output
 file type of `com.apple.immersive-video`. This copies the compressed MV-HEVC
@@ -69,6 +87,31 @@ AIVU boxes, so the result opens correctly in Apple Immersive Video Utility.
 > **Note on cut accuracy:** like any lossless trim on any format, the start of the
 > output snaps to the nearest keyframe in the source. Your exact in point may shift
 > by up to one GOP interval. Avoiding this would require re-encoding.
+
+## How the side-by-side MP4 export works
+
+For Meta Quest 3 the app re-encodes the trimmed range with FFmpeg:
+
+```
+ffmpeg -ss <in> -t <dur> -i input.aivu \
+  -filter_complex "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840,fps=60[v]" \
+  -map "[v]" -map "0:a:0?" \
+  -c:v hevc_videotoolbox -b:v 60M -tag:v hvc1 -c:a aac -b:a 192k \
+  -movflags +faststart output_SBS_60fps.mp4
+```
+
+- Both MV-HEVC eye views are decoded (`view:0` / `view:1`) and placed
+  **side-by-side** (left eye | right eye).
+- Output is **7680×3840** — under the Quest 3's HEVC decode ceiling. (Full-res SBS
+  would be 8640 px wide, beyond HEVC's 8192 limit, so it's scaled to 8K width.)
+- The `fps=60` filter resamples 90→60 fps **by timestamp**, i.e. it drops frames
+  without altering playback speed.
+- Encoded as HEVC (H.265) — H.264 can't exceed 4096 px, so it isn't an option at
+  this resolution.
+
+On the Quest 3, copy the `.mp4` over and open it in a VR video player
+(DeoVR, Skybox, etc.), then select a **side-by-side / 180° stereo** viewing mode to
+match the source projection.
 
 ## License
 
