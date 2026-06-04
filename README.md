@@ -26,6 +26,9 @@ Set in/out points on a visual player with a timecode display, then export.
 - **Side-by-side MP4 export** (Meta Quest 3): decodes both MV-HEVC eye views, packs
   them side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and
   encodes HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
+- **Color LUT** option for the SBS export — apply a `.cube` 3D LUT (e.g. Blackmagic
+  Gen 5 Film → Rec709). See [`luts/`](luts/)
+- **Live progress bar** with percentage during both exports
 
 ## Requirements
 
@@ -76,6 +79,7 @@ python3 aivu_trimmer.py movie.aivu      # or open a file directly
 | Zoom preview | **Zoom +** / **Zoom −** / **Fit** buttons |
 | Export lossless `.aivu` | **Export .aivu…** button |
 | Export side-by-side MP4 | **Export SBS MP4 (Quest)…** button |
+| Apply a color LUT (SBS only) | **Color LUT** dropdown |
 
 ## How the lossless `.aivu` trim works
 
@@ -112,6 +116,23 @@ ffmpeg -ss <in> -t <dur> -i input.aivu \
 On the Quest 3, copy the `.mp4` over and open it in a VR video player
 (DeoVR, Skybox, etc.), then select a **side-by-side / 180° stereo** viewing mode to
 match the source projection.
+
+## Color LUTs
+
+The **Color LUT** dropdown lets you bake a `.cube` 3D LUT into the side-by-side MP4
+export (via FFmpeg's `lut3d` filter). It's intended for converting **Blackmagic
+Cine immersive footage (Gen 5 Film color science) to Rec709**.
+
+- The app discovers `.cube` files from the [`luts/`](luts/) folder, and if that's
+  empty, falls back to the Gen 5 Rec709 LUTs that ship with **DaVinci Resolve**.
+- The Blackmagic `.cube` files are **not redistributed** in this repo — they're
+  Blackmagic's. Install DaVinci Resolve (free) or drop your own LUTs in `luts/`.
+- LUTs apply **only** to the SBS MP4 export. The lossless `.aivu` export copies the
+  original bitstream untouched, so there's nothing to color-transform.
+
+> **Only apply a Film→Rec709 LUT to log/Film-gamma footage.** If your `.aivu` is
+> already display-ready (graded Rec709), the LUT will double-correct it. Leave the
+> dropdown on **No LUT** when in doubt.
 
 ## License
 

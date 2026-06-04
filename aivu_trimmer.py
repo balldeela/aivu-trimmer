@@ -25,7 +25,7 @@ from AppKit import (
     NSBackingStoreBuffered, NSApplicationActivationPolicyRegular,
     NSProgressIndicator, NSProgressIndicatorStyleBar,
     NSViewWidthSizable, NSViewHeightSizable, NSViewMaxYMargin,
-    NSViewMinXMargin,
+    NSViewMinXMargin, NSPopUpButton,
 )
 import Quartz
 from AVFoundation import (
@@ -203,6 +203,9 @@ class AivuTrimmerApp(NSObject):
         self._sbs_btn = None
         self._status_label = None
         self._progress = None
+        self._lut_popup = None
+        self._luts = []        # list of (label, path); first entry is "No LUT"
+        self._status_base = ""
         self._zoom = 1.0
         return self
 
@@ -305,6 +308,26 @@ class AivuTrimmerApp(NSObject):
         sbs_btn = self.addButton_title_rect_action_(c, "Export SBS MP4 (Quest)…", NSMakeRect(540, 35, 210, 32), "exportSBS:")
         sbs_btn.setEnabled_(False)
         self._sbs_btn = sbs_btn
+
+        # LUT selector (applied only to the SBS MP4 export, which re-encodes)
+        lut_cap = self.makeTextField_rect_font_color_(
+            "Color LUT (SBS export):", NSMakeRect(760, 70, 230, 14),
+            NSFont.systemFontOfSize_(10), NSColor.lightGrayColor(),
+        )
+        lut_cap.setAutoresizingMask_(NSViewMinXMargin)
+        c.addSubview_(lut_cap)
+
+        popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(760, 35, 230, 32), False
+        )
+        popup.setAutoresizingMask_(NSViewMinXMargin)
+        self._luts = self.discoverLUTs()
+        for label, _ in self._luts:
+            popup.addItemWithTitle_(label)
+        popup.setToolTip_("Applies a 3D LUT during the side-by-side MP4 export. "
+                          "Ignored by the lossless .aivu export.")
+        c.addSubview_(popup)
+        self._lut_popup = popup
 
         # Keep a ref to play button to update its title
         for sub in c.subviews():
@@ -573,11 +596,17 @@ class AivuTrimmerApp(NSObject):
 
             session.exportAsynchronouslyWithCompletionHandler_(on_complete)
 
-            # Wait for completion (runs on AVFoundation's internal queue)
+            # Wait for completion (runs on AVFoundation's internal queue),
+            # polling the session's progress to drive the progress bar.
             for _ in range(1200):  # up to 10 min
                 if result_box[0] is not None:
                     break
-                time.sleep(0.5)
+                try:
+                    self.setProgressFraction_(session.progress())
+                except Exception:
+                    pass
+                time.sleep(0.25)
+            self.setProgressFraction_(1.0)
 
             ok, msg = result_box[0] if result_box[0] else (False, "Export timed out.")
 
@@ -630,6 +659,48 @@ class AivuTrimmerApp(NSObject):
         out_path = str(panel.URL().path())
         self.runSBSExport_start_duration_ffmpeg_(out_path, self._in_point, trim_dur, ffmpeg)
 
+    def discoverLUTs(self):
+        """Return [(label, path|None)] — 'No LUT' first, then discovered .cube files.
+
+        Prefer LUTs bundled in the local ``luts/`` folder; if none are present
+        (e.g. a fresh clone where they were not redistributed), fall back to the
+        Gen 5 Rec709 LUTs from a DaVinci Resolve installation.
+        """
+        def cubes_in(d):
+            if not os.path.isdir(d):
+                return []
+            try:
+                return sorted(n for n in os.listdir(d) if n.lower().endswith(".cube"))
+            except OSError:
+                return []
+
+        luts = [("No LUT (passthrough)", None)]
+        here = os.path.dirname(os.path.abspath(__file__))
+        bundled = os.path.join(here, "luts")
+
+        names = cubes_in(bundled)
+        if names:
+            for name in names:
+                luts.append((os.path.splitext(name)[0], os.path.join(bundled, name)))
+            return luts
+
+        # Fallback: Blackmagic's Gen 5 -> Rec709 LUTs from DaVinci Resolve
+        resolve = ("/Library/Application Support/Blackmagic Design/"
+                   "DaVinci Resolve/LUT/Blackmagic Design")
+        for name in cubes_in(resolve):
+            if "gen 5" not in name.lower():
+                continue
+            luts.append((os.path.splitext(name)[0], os.path.join(resolve, name)))
+        return luts
+
+    def selectedLUTPath(self):
+        if self._lut_popup is None:
+            return None
+        idx = self._lut_popup.indexOfSelectedItem()
+        if 0 <= idx < len(self._luts):
+            return self._luts[idx][1]
+        return None
+
     def findFFmpeg(self):
         import shutil
         found = shutil.which("ffmpeg")
@@ -648,47 +719,79 @@ class AivuTrimmerApp(NSObject):
         return None
 
     def runSBSExport_start_duration_ffmpeg_(self, out_path, start, duration, ffmpeg):
-        self._beginExportUI_("Exporting side-by-side MP4 (this can take a few minutes)…")
+        lut_path = self.selectedLUTPath()
+        self._beginExportUI_("Exporting side-by-side MP4…")
         src = self._source_path
 
+        # Build the filtergraph: both eye views -> side-by-side -> 8K-wide ->
+        # optional 3D LUT -> 60 fps (frame-drop, no speed change).
+        chain = "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840"
+        if lut_path:
+            esc = lut_path.replace("\\", "\\\\").replace("'", "\\'")
+            chain += ",lut3d=file='%s'" % esc
+        chain += ",fps=60[v]"
+
         def do_export():
+            import tempfile
             if os.path.exists(out_path):
                 try:
                     os.remove(out_path)
                 except OSError:
                     pass
 
-            # Decode both MV-HEVC eye views, place them side-by-side, scale to
-            # an 8K-wide frame (≤ Quest 3's HEVC decode limit), drop 90→60 fps
-            # without changing speed (the fps filter resamples by timestamp),
-            # and encode with Apple's hardware HEVC encoder.
             cmd = [
-                ffmpeg, "-hide_banner", "-v", "error", "-y",
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
+                "-progress", "pipe:1", "-y",
                 "-ss", f"{start:.6f}", "-t", f"{duration:.6f}",
                 "-i", src,
-                "-filter_complex",
-                "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840,fps=60[v]",
+                "-filter_complex", chain,
                 "-map", "[v]", "-map", "0:a:0?",
                 "-c:v", "hevc_videotoolbox", "-b:v", "60M", "-tag:v", "hvc1",
                 "-c:a", "aac", "-b:a", "192k",
                 "-movflags", "+faststart",
                 out_path,
             ]
+
+            errf = tempfile.NamedTemporaryFile(delete=False, suffix=".log",
+                                               mode="w+", encoding="utf-8")
+            ok, msg = False, "Done."
+            last_pct = -1.0
             try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                ok = result.returncode == 0 and os.path.exists(out_path)
-                msg = (result.stderr or result.stdout).strip() or "Done."
-            except subprocess.TimeoutExpired:
-                ok, msg = False, "Export timed out (over 60 minutes)."
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
+                                        text=True)
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                        val = line.split("=", 1)[1]
+                        try:
+                            us = int(val)
+                        except ValueError:
+                            continue
+                        frac = max(0.0, min((us / 1e6) / duration, 1.0))
+                        pct = frac * 100.0
+                        if pct - last_pct >= 0.5:   # throttle UI updates
+                            last_pct = pct
+                            self.setProgressFraction_(frac)
+                proc.wait()
+                ok = proc.returncode == 0 and os.path.exists(out_path)
+                errf.flush(); errf.seek(0)
+                err_text = errf.read().strip()
+                msg = err_text or "Done."
             except Exception as e:
                 ok, msg = False, str(e)
+            finally:
+                try:
+                    errf.close(); os.remove(errf.name)
+                except OSError:
+                    pass
 
             def finish():
                 self._endExportUI()
                 if ok:
+                    extra = ("\nLUT: %s" % os.path.basename(lut_path)) if lut_path else ""
                     self.showAlert_message_(
                         "SBS MP4 export complete",
-                        f"Saved 7680×3840 side-by-side HEVC at 60 fps to:\n{out_path}",
+                        f"Saved 7680×3840 side-by-side HEVC at 60 fps to:\n{out_path}{extra}",
                     )
                 else:
                     self.showAlert_message_("SBS export failed", msg[-800:])
@@ -706,16 +809,38 @@ class AivuTrimmerApp(NSObject):
     def _beginExportUI_(self, status_text):
         self._export_btn.setEnabled_(False)
         self._sbs_btn.setEnabled_(False)
-        self._status_label.setStringValue_(status_text)
+        self._status_base = status_text
+        self._status_label.setStringValue_(status_text + "  0%")
+        self._progress.setIndeterminate_(False)
+        self._progress.setMinValue_(0.0)
+        self._progress.setMaxValue_(100.0)
+        self._progress.setDoubleValue_(0.0)
         self._progress.setHidden_(False)
-        self._progress.startAnimation_(None)
 
     def _endExportUI(self):
-        self._progress.stopAnimation_(None)
+        self._progress.setDoubleValue_(0.0)
         self._progress.setHidden_(True)
         self._status_label.setStringValue_("")
         self._export_btn.setEnabled_(True)
         self._sbs_btn.setEnabled_(True)
+
+    def setProgressFraction_(self, frac):
+        """Thread-safe: update the determinate progress bar + status percentage."""
+        try:
+            f = float(frac)
+        except (TypeError, ValueError):
+            return
+
+        def apply():
+            pct = max(0.0, min(f * 100.0, 100.0))
+            self._progress.setDoubleValue_(pct)
+            base = getattr(self, "_status_base", "")
+            if base:
+                self._status_label.setStringValue_("%s  %d%%" % (base, int(pct)))
+
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "runCallback:", apply, False
+        )
 
     def runCallback_(self, block):
         block()

@@ -19,3 +19,7 @@ venv/
 *.mov
 *.mp4
 *.m4v
+
+# Bundled LUTs are NOT redistributed (Blackmagic's .cube files are theirs).
+# They live in luts/ locally; the app auto-discovers them from DaVinci Resolve.
+luts/*.cube
