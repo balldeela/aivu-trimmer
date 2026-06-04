@@ -31,8 +31,11 @@ import Quartz
 from AVFoundation import (
     AVPlayer, AVPlayerItem, AVAsset,
     AVPlayerTimeControlStatusPlaying,
+    AVMutableVideoComposition,
 )
 from AVKit import AVPlayerView
+from Foundation import NSData
+from Quartz import CIFilter
 import CoreMedia
 from CoreMedia import CMTimeMakeWithSeconds, CMTimeGetSeconds, kCMTimeZero
 
@@ -206,6 +209,8 @@ class AivuTrimmerApp(NSObject):
         self._lut_popup = None
         self._luts = []        # list of (label, path); first entry is "No LUT"
         self._status_base = ""
+        self._asset = None     # current AVAsset (for preview LUT composition)
+        self._cube_cache = {}  # path -> (size, NSData) parsed .cube
         self._zoom = 1.0
         return self
 
@@ -324,8 +329,10 @@ class AivuTrimmerApp(NSObject):
         self._luts = self.discoverLUTs()
         for label, _ in self._luts:
             popup.addItemWithTitle_(label)
-        popup.setToolTip_("Applies a 3D LUT during the side-by-side MP4 export. "
-                          "Ignored by the lossless .aivu export.")
+        popup.setToolTip_("Previews a 3D LUT on the player and bakes it into the "
+                          "side-by-side MP4 export. Ignored by the lossless .aivu export.")
+        popup.setTarget_(self)
+        popup.setAction_("lutChanged:")
         c.addSubview_(popup)
         self._lut_popup = popup
 
@@ -404,6 +411,7 @@ class AivuTrimmerApp(NSObject):
         asset = AVAsset.assetWithURL_(url)
         item = AVPlayerItem.playerItemWithAsset_(asset)
         self._player_item = item
+        self._asset = asset
 
         if self._player is None:
             player = AVPlayer.playerWithPlayerItem_(item)
@@ -413,6 +421,7 @@ class AivuTrimmerApp(NSObject):
             self._player.replaceCurrentItemWithPlayerItem_(item)
 
         self.startTimeObserver()
+        self.applyPreviewLUT()   # carry the current LUT selection onto the new item
 
         def poll_duration():
             for _ in range(100):
@@ -700,6 +709,104 @@ class AivuTrimmerApp(NSObject):
         if 0 <= idx < len(self._luts):
             return self._luts[idx][1]
         return None
+
+    # ------------------------------------------------------------------ #
+    #  Live LUT preview (Core Image color cube on the player)             #
+    # ------------------------------------------------------------------ #
+
+    def lutChanged_(self, sender):
+        self.applyPreviewLUT()
+
+    def loadCube_(self, path):
+        """Parse a 3D .cube LUT into (size, NSData of RGBA float32). Cached."""
+        if path in self._cube_cache:
+            return self._cube_cache[path]
+        import array
+        size = None
+        data = array.array('f')
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#"):
+                        continue
+                    up = s.upper()
+                    if up.startswith("LUT_3D_SIZE"):
+                        size = int(s.split()[-1])
+                        continue
+                    if up.startswith("LUT_1D_SIZE"):
+                        self._cube_cache[path] = None   # 1D not supported here
+                        return None
+                    if up[0].isalpha():                 # TITLE/DOMAIN_*/etc.
+                        continue
+                    parts = s.split()
+                    if len(parts) >= 3:
+                        try:
+                            r, g, b = float(parts[0]), float(parts[1]), float(parts[2])
+                        except ValueError:
+                            continue
+                        data.extend((r, g, b, 1.0))
+        except OSError:
+            self._cube_cache[path] = None
+            return None
+
+        if not size or len(data) != size * size * size * 4:
+            self._cube_cache[path] = None
+            return None
+
+        raw = data.tobytes()
+        nsdata = NSData.dataWithBytes_length_(raw, len(raw))
+        result = (size, nsdata)
+        self._cube_cache[path] = result
+        return result
+
+    def applyPreviewLUT(self):
+        """Apply (or clear) the selected LUT on the current player item via a
+        Core Image color-cube video composition. Approximate preview only — the
+        export still uses FFmpeg's lut3d for the exact result."""
+        item = self._player_item
+        if item is None:
+            return
+        path = self.selectedLUTPath()
+
+        if not path:
+            item.setVideoComposition_(None)
+            return
+
+        cube = self.loadCube_(path)
+        if not cube:
+            item.setVideoComposition_(None)
+            return
+        size, nsdata = cube
+
+        filt = CIFilter.filterWithName_("CIColorCube")
+        if filt is None:
+            item.setVideoComposition_(None)
+            return
+        filt.setValue_forKey_(size, "inputCubeDimension")
+        filt.setValue_forKey_(nsdata, "inputCubeData")
+
+        def handler(request):
+            try:
+                src = request.sourceImage()
+                filt.setValue_forKey_(src, "inputImage")
+                out = filt.outputImage()
+                if out is None:
+                    out = src
+                else:
+                    # keep the original extent so geometry is unchanged
+                    out = out.imageByCroppingToRect_(src.extent())
+                request.finishWithImage_context_(out, None)
+            except Exception:
+                request.finishWithImage_context_(request.sourceImage(), None)
+
+        try:
+            comp = AVMutableVideoComposition.videoCompositionWithAsset_applyingCIFiltersWithHandler_(
+                self._asset, handler
+            )
+            item.setVideoComposition_(comp)
+        except Exception:
+            item.setVideoComposition_(None)
 
     def findFFmpeg(self):
         import shutil

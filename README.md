@@ -26,8 +26,8 @@ Set in/out points on a visual player with a timecode display, then export.
 - **Side-by-side MP4 export** (Meta Quest 3): decodes both MV-HEVC eye views, packs
   them side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and
   encodes HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
-- **Color LUT** option for the SBS export — apply a `.cube` 3D LUT (e.g. Blackmagic
-  Gen 5 Film → Rec709). See [`luts/`](luts/)
+- **Color LUT** option — preview a `.cube` 3D LUT live on the player and bake it
+  into the SBS export (e.g. Blackmagic Gen 5 Film → Rec709). See [`luts/`](luts/)
 - **Live progress bar** with percentage during both exports
 
 ## Requirements
@@ -119,9 +119,13 @@ match the source projection.
 
 ## Color LUTs
 
-The **Color LUT** dropdown lets you bake a `.cube` 3D LUT into the side-by-side MP4
+The **Color LUT** dropdown previews a `.cube` 3D LUT **live on the player** (via a
+Core Image `CIColorCube` video composition) and bakes it into the side-by-side MP4
 export (via FFmpeg's `lut3d` filter). It's intended for converting **Blackmagic
 Cine immersive footage (Gen 5 Film color science) to Rec709**.
+
+> The on-screen preview is a fast Core Image approximation (and flattens to a single
+> eye while filtering); the exported file uses FFmpeg's exact `lut3d` result.
 
 - The app discovers `.cube` files from the [`luts/`](luts/) folder, and if that's
   empty, falls back to the Gen 5 Rec709 LUTs that ship with **DaVinci Resolve**.
