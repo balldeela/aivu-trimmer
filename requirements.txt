@@ -1,0 +1,5 @@
+pyobjc-framework-Cocoa>=10.0
+pyobjc-framework-Quartz>=10.0
+pyobjc-framework-AVFoundation>=10.0
+pyobjc-framework-AVKit>=10.0
+pyobjc-framework-CoreMedia>=10.0

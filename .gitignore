@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# py2app / packaging artifacts
+*.app
+
+# macOS
+.DS_Store
+
+# Media test files
+*.aivu
+*.mov
+*.mp4
+*.m4v
