@@ -210,7 +210,13 @@ class AivuTrimmerApp(NSObject):
 
     def applicationDidFinishLaunching_(self, notification):
         self.buildWindow()
-        self.promptOpenFile()
+        # Allow launching with a file path: `python3 aivu_trimmer.py movie.aivu`
+        import sys
+        args = [a for a in sys.argv[1:] if os.path.isfile(a)]
+        if args:
+            self.loadFile_(args[0])
+        else:
+            self.promptOpenFile()
 
     def applicationShouldTerminateAfterLastWindowClosed_(self, app):
         return True
