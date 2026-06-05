@@ -615,18 +615,28 @@ class AivuTrimmerApp(NSObject):
             self.showAlert_message_("Invalid range", "Out point must be after in point.")
             return
 
-        graded = self.processingActive()
         base, ext = os.path.splitext(self._source_path)
 
+        # If a LUT / grade is active, ask whether to keep it lossless (ignoring
+        # the look) or re-encode with the look baked in.
+        graded = False
+        if self.processingActive():
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("A color LUT / grade is active")
+            alert.setInformativeText_(
+                "Export a lossless, ungraded immersive .aivu (copies the original "
+                "bitstream, ignoring the LUT and grade)?\n\nOr re-encode with the "
+                "look baked in — which produces a mono, standard "
+                "(non-immersive) movie.")
+            alert.addButtonWithTitle_("Lossless & ungraded")   # first  -> 1000
+            alert.addButtonWithTitle_("Re-encode & graded")     # second -> 1001
+            alert.addButtonWithTitle_("Cancel")                 # third  -> 1002
+            resp = alert.runModal()
+            if resp == 1002:
+                return
+            graded = (resp == 1001)
+
         if graded:
-            # A grade/LUT is active: the only way to bake it in is to re-encode,
-            # which flattens to mono and drops the immersive metadata.
-            self.showAlert_message_(
-                "Re-encoding graded video",
-                "A color grade or LUT is active. The exported file will be "
-                "re-encoded with the look baked in — which makes it a mono, "
-                "standard (non-immersive) movie.\n\nFor a true lossless immersive "
-                ".aivu, reset the grade and set the LUT to “No LUT”.")
             suggested = os.path.basename(base + "_graded.mov")
             allowed = ["mov", "mp4", "m4v"]
         else:

@@ -162,10 +162,16 @@ Three sliders apply a simple grade (gain → contrast → gamma) that updates th
 - **SBS & rectilinear MP4** use the equivalent FFmpeg `lutrgb` expression.
 - **Reset** returns all three to neutral (1.00).
 
-When any grade or LUT is active and you hit **Export .aivu…**, the file must be
-**re-encoded** to bake in the look — which flattens it to a **mono, standard
-(non-immersive) movie**. For a true lossless immersive `.aivu`, reset the grade and
-set the LUT to *No LUT*.
+When a grade or LUT is active and you hit **Export .aivu…**, the app asks how to
+proceed:
+
+- **Lossless & ungraded** — copies the original bitstream untouched (the LUT/grade
+  are ignored), giving a true lossless immersive `.aivu`.
+- **Re-encode & graded** — bakes the look in, which flattens it to a **mono, standard
+  (non-immersive) movie**.
+
+The grade/LUT still always affect the SBS and rectilinear MP4 exports and the
+preview.
 
 ## Rectilinear 16:9 export
 
