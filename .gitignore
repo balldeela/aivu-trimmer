@@ -23,3 +23,7 @@ venv/
 # Bundled LUTs are NOT redistributed (Blackmagic's .cube files are theirs).
 # They live in luts/ locally; the app auto-discovers them from DaVinci Resolve.
 luts/*.cube
+
+# Generated remap maps (derived from the proprietary Blackmagic ST map EXR).
+# Regenerated on demand from the user's own .exr.
+cache/

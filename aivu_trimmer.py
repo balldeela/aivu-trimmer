@@ -25,7 +25,7 @@ from AppKit import (
     NSBackingStoreBuffered, NSApplicationActivationPolicyRegular,
     NSProgressIndicator, NSProgressIndicatorStyleBar,
     NSViewWidthSizable, NSViewHeightSizable, NSViewMaxYMargin,
-    NSViewMinXMargin, NSPopUpButton,
+    NSViewMinXMargin, NSPopUpButton, NSSlider,
 )
 import Quartz
 from AVFoundation import (
@@ -40,6 +40,37 @@ import CoreMedia
 from CoreMedia import CMTimeMakeWithSeconds, CMTimeGetSeconds, kCMTimeZero
 
 ASSUMED_FPS = 45.0
+
+# Rectilinear (mono) export geometry, derived from the stereoscopic ST map.
+EYE_SIZE = 4320          # source single-eye square the ST map was authored for
+RECTI_SQUARE = 2048      # remap output (per eye) before cropping
+RECTI_OUT_W = 2048
+RECTI_OUT_H = 1152       # 16:9 crop of the square
+RECTI_CROP_Y = (RECTI_SQUARE - RECTI_OUT_H) // 2
+
+# Default location of the Blackmagic immersive ST map EXR (user-provided).
+DEFAULT_STMAP = os.path.expanduser(
+    "~/Library/Mobile Documents/com~apple~CloudDocs/Downloads/"
+    "URSA_Immersive_Stereoscopic_v01_STMap.0000.exr"
+)
+
+# Neutral grade (no-op)
+GRADE_NEUTRAL = {"contrast": 1.0, "gamma": 1.0, "gain": 1.0}
+
+
+def grade_is_neutral(g):
+    return (abs(g["contrast"] - 1.0) < 1e-3 and
+            abs(g["gamma"] - 1.0) < 1e-3 and
+            abs(g["gain"] - 1.0) < 1e-3)
+
+
+def ffmpeg_grade_expr(g):
+    """A single lutrgb expression applying gain -> contrast -> gamma, or None."""
+    if grade_is_neutral(g):
+        return None
+    K, C, G = g["gain"], g["contrast"], g["gamma"]
+    return ("clip(pow(clip(((val/maxval)*%s-0.5)*%s+0.5,0,1),1/%s)*maxval,0,maxval)"
+            % (K, C, G))
 
 
 def seconds_to_tc(secs: float) -> str:
@@ -209,9 +240,15 @@ class AivuTrimmerApp(NSObject):
         self._lut_popup = None
         self._luts = []        # list of (label, path); first entry is "No LUT"
         self._status_base = ""
-        self._asset = None     # current AVAsset (for preview LUT composition)
+        self._asset = None     # current AVAsset (for preview composition)
         self._cube_cache = {}  # path -> (size, NSData) parsed .cube
         self._zoom = 1.0
+        # Color grade
+        self._grade = dict(GRADE_NEUTRAL)
+        self._recti_btn = None
+        self._sliders = {}     # name -> NSSlider
+        self._slider_vals = {} # name -> NSTextField (value readout)
+        self._stmap_path = DEFAULT_STMAP if os.path.isfile(DEFAULT_STMAP) else None
         return self
 
     # ------------------------------------------------------------------ #
@@ -239,15 +276,14 @@ class AivuTrimmerApp(NSObject):
         style = (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(100, 100, 1000, 620), style, NSBackingStoreBuffered, False,
+            NSMakeRect(100, 100, 1000, 720), style, NSBackingStoreBuffered, False,
         )
         win.setTitle_("AIVU Trimmer")
-        win.setMinSize_((860, 500))
+        win.setMinSize_((900, 560))
         c = win.contentView()
 
-        # Player view — grows with the window (width + height flexible),
-        # bottom edge pinned at y=160 so it never overlaps the timeline.
-        pv = AVPlayerView.alloc().initWithFrame_(NSMakeRect(0, 160, 1000, 420))
+        # Player view — grows with the window; bottom pinned at y=228.
+        pv = AVPlayerView.alloc().initWithFrame_(NSMakeRect(0, 228, 1000, 484))
         pv.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
         pv.setControlsStyle_(0)
         pv.setWantsLayer_(True)
@@ -255,86 +291,86 @@ class AivuTrimmerApp(NSObject):
         c.addSubview_(pv)
         self._player_view = pv
 
-        # Timeline — fixed height, pinned a fixed distance above the bottom
-        # controls (flexible TOP margin so the gap above it absorbs resizing).
-        tv = TimelineView.alloc().initWithFrame_(NSMakeRect(0, 110, 1000, 50))
+        # Timeline — fixed height, fixed distance above the bottom controls.
+        tv = TimelineView.alloc().initWithFrame_(NSMakeRect(0, 176, 1000, 46))
         tv.setup(self)
         tv.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxYMargin)
         c.addSubview_(tv)
         self._timeline_view = tv
 
-        # Timecode label
+        # --- Grade sliders row (y≈118) ---
+        self.addSlider_name_x_y_width_lo_hi_val_caption_(
+            c, "contrast", 10, 122, 230, 0.5, 2.0, 1.0, "Contrast")
+        self.addSlider_name_x_y_width_lo_hi_val_caption_(
+            c, "gamma", 256, 122, 230, 0.4, 2.5, 1.0, "Gamma")
+        self.addSlider_name_x_y_width_lo_hi_val_caption_(
+            c, "gain", 502, 122, 230, 0.5, 2.0, 1.0, "Gain")
+        reset = self.addButton_title_rect_action_(
+            c, "Reset", NSMakeRect(742, 120, 64, 26), "resetGrade:")
+        reset.setToolTip_("Reset contrast / gamma / gain to neutral.")
+
+        # Zoom controls (far right of the grade row, tracks right edge)
+        zout = self.addButton_title_rect_action_(c, "Zoom −", NSMakeRect(818, 120, 56, 26), "zoomOut:")
+        zin  = self.addButton_title_rect_action_(c, "Zoom +", NSMakeRect(878, 120, 56, 26), "zoomIn:")
+        zfit = self.addButton_title_rect_action_(c, "Fit",    NSMakeRect(938, 120, 50, 26), "zoomReset:")
+        for b in (zout, zin, zfit):
+            b.setAutoresizingMask_(NSViewMinXMargin)
+
+        # --- Timecode / IN / OUT row (y≈82) + LUT selector on the right ---
         tc = self.makeTextField_rect_font_color_(
-            "00:00:00:00",
-            NSMakeRect(10, 76, 220, 28),
-            NSFont.monospacedDigitSystemFontOfSize_weight_(18, 0),
-            NSColor.whiteColor(),
-        )
+            "00:00:00:00", NSMakeRect(10, 82, 220, 28),
+            NSFont.monospacedDigitSystemFontOfSize_weight_(18, 0), NSColor.whiteColor())
         c.addSubview_(tc)
         self._tc_label = tc
 
-        # In label
         in_lbl = self.makeTextField_rect_font_color_(
-            "IN:  00:00:00:00",
-            NSMakeRect(240, 76, 220, 28),
-            NSFont.monospacedDigitSystemFontOfSize_weight_(14, 0),
-            NSColor.yellowColor(),
-        )
+            "IN:  00:00:00:00", NSMakeRect(238, 82, 210, 28),
+            NSFont.monospacedDigitSystemFontOfSize_weight_(14, 0), NSColor.yellowColor())
         c.addSubview_(in_lbl)
         self._in_label = in_lbl
 
-        # Out label
         out_lbl = self.makeTextField_rect_font_color_(
-            "OUT: 00:00:00:00",
-            NSMakeRect(470, 76, 220, 28),
-            NSFont.monospacedDigitSystemFontOfSize_weight_(14, 0),
-            NSColor.redColor(),
-        )
+            "OUT: 00:00:00:00", NSMakeRect(452, 82, 210, 28),
+            NSFont.monospacedDigitSystemFontOfSize_weight_(14, 0), NSColor.redColor())
         c.addSubview_(out_lbl)
         self._out_label = out_lbl
 
-        # Zoom controls (right side of the label row, tracks right edge)
-        zout = self.addButton_title_rect_action_(c, "Zoom −", NSMakeRect(800, 74, 60, 30), "zoomOut:")
-        zin  = self.addButton_title_rect_action_(c, "Zoom +", NSMakeRect(863, 74, 60, 30), "zoomIn:")
-        zfit = self.addButton_title_rect_action_(c, "Fit",    NSMakeRect(926, 74, 54, 30), "zoomReset:")
-        for b in (zout, zin, zfit):
-            b.setAutoresizingMask_(NSViewMinXMargin)  # stick to right edge
-
-        # Buttons row
-        self.addButton_title_rect_action_(c, "▶  Play",  NSMakeRect(10,  35, 80, 32), "togglePlayPause:")
-        self.addButton_title_rect_action_(c, "🟡 Set In",  NSMakeRect(98,  35, 92, 32), "setInPoint:")
-        self.addButton_title_rect_action_(c, "🔴 Set Out", NSMakeRect(198, 35, 98, 32), "setOutPoint:")
-        self.addButton_title_rect_action_(c, "Open…",     NSMakeRect(304, 35, 70, 32), "openFile:")
-
-        exp_btn = self.addButton_title_rect_action_(c, "Export .aivu…", NSMakeRect(382, 35, 150, 32), "exportTrimmed:")
-        exp_btn.setEnabled_(False)
-        self._export_btn = exp_btn
-
-        sbs_btn = self.addButton_title_rect_action_(c, "Export SBS MP4 (Quest)…", NSMakeRect(540, 35, 210, 32), "exportSBS:")
-        sbs_btn.setEnabled_(False)
-        self._sbs_btn = sbs_btn
-
-        # LUT selector (applied only to the SBS MP4 export, which re-encodes)
         lut_cap = self.makeTextField_rect_font_color_(
-            "Color LUT (SBS export):", NSMakeRect(760, 70, 230, 14),
-            NSFont.systemFontOfSize_(10), NSColor.lightGrayColor(),
-        )
+            "Color LUT (preview + export):", NSMakeRect(718, 104, 272, 14),
+            NSFont.systemFontOfSize_(10), NSColor.lightGrayColor())
         lut_cap.setAutoresizingMask_(NSViewMinXMargin)
         c.addSubview_(lut_cap)
 
         popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(760, 35, 230, 32), False
-        )
+            NSMakeRect(718, 80, 272, 26), False)
         popup.setAutoresizingMask_(NSViewMinXMargin)
         self._luts = self.discoverLUTs()
         for label, _ in self._luts:
             popup.addItemWithTitle_(label)
         popup.setToolTip_("Previews a 3D LUT on the player and bakes it into the "
-                          "side-by-side MP4 export. Ignored by the lossless .aivu export.")
+                          "MP4 exports.")
         popup.setTarget_(self)
         popup.setAction_("lutChanged:")
         c.addSubview_(popup)
         self._lut_popup = popup
+
+        # --- Buttons row (y=42) ---
+        self.addButton_title_rect_action_(c, "▶  Play",  NSMakeRect(10,  42, 64, 32), "togglePlayPause:")
+        self.addButton_title_rect_action_(c, "🟡 Set In",  NSMakeRect(78,  42, 84, 32), "setInPoint:")
+        self.addButton_title_rect_action_(c, "🔴 Set Out", NSMakeRect(166, 42, 90, 32), "setOutPoint:")
+        self.addButton_title_rect_action_(c, "Open…",     NSMakeRect(260, 42, 64, 32), "openFile:")
+
+        exp_btn = self.addButton_title_rect_action_(c, "Export .aivu…", NSMakeRect(330, 42, 128, 32), "exportTrimmed:")
+        exp_btn.setEnabled_(False)
+        self._export_btn = exp_btn
+
+        sbs_btn = self.addButton_title_rect_action_(c, "Export SBS MP4 (Quest)…", NSMakeRect(464, 42, 196, 32), "exportSBS:")
+        sbs_btn.setEnabled_(False)
+        self._sbs_btn = sbs_btn
+
+        recti_btn = self.addButton_title_rect_action_(c, "Export Rectilinear 16:9…", NSMakeRect(666, 42, 200, 32), "exportRectilinear:")
+        recti_btn.setEnabled_(False)
+        self._recti_btn = recti_btn
 
         # Keep a ref to play button to update its title
         for sub in c.subviews():
@@ -389,6 +425,30 @@ class AivuTrimmerApp(NSObject):
         parent.addSubview_(btn)
         return btn
 
+    def addSlider_name_x_y_width_lo_hi_val_caption_(
+            self, parent, name, x, y, width, lo, hi, val, caption):
+        cap = self.makeTextField_rect_font_color_(
+            caption, NSMakeRect(x, y + 22, width, 13),
+            NSFont.systemFontOfSize_(10), NSColor.lightGrayColor())
+        parent.addSubview_(cap)
+
+        s = NSSlider.alloc().initWithFrame_(NSMakeRect(x, y, width - 50, 20))
+        s.setMinValue_(lo)
+        s.setMaxValue_(hi)
+        s.setDoubleValue_(val)
+        s.setContinuous_(True)
+        s.setTarget_(self)
+        s.setAction_("gradeChanged:")
+        parent.addSubview_(s)
+        self._sliders[name] = s
+
+        vlbl = self.makeTextField_rect_font_color_(
+            "%.2f" % val, NSMakeRect(x + width - 46, y, 44, 18),
+            NSFont.monospacedDigitSystemFontOfSize_weight_(11, 0), NSColor.whiteColor())
+        parent.addSubview_(vlbl)
+        self._slider_vals[name] = vlbl
+        return s
+
     # ------------------------------------------------------------------ #
     #  File open                                                           #
     # ------------------------------------------------------------------ #
@@ -421,7 +481,7 @@ class AivuTrimmerApp(NSObject):
             self._player.replaceCurrentItemWithPlayerItem_(item)
 
         self.startTimeObserver()
-        self.applyPreviewLUT()   # carry the current LUT selection onto the new item
+        self.applyPreviewProcessing()   # carry grade + LUT onto the new item
 
         def poll_duration():
             for _ in range(100):
@@ -438,6 +498,7 @@ class AivuTrimmerApp(NSObject):
             self._timeline_view.setNeedsDisplay_(True)
             self._export_btn.setEnabled_(True)
             self._sbs_btn.setEnabled_(True)
+            self._recti_btn.setEnabled_(True)
 
         threading.Thread(target=poll_duration, daemon=True).start()
 
@@ -554,18 +615,36 @@ class AivuTrimmerApp(NSObject):
             self.showAlert_message_("Invalid range", "Out point must be after in point.")
             return
 
+        graded = self.processingActive()
         base, ext = os.path.splitext(self._source_path)
-        suggested = os.path.basename(base + "_trimmed" + ext)
+
+        if graded:
+            # A grade/LUT is active: the only way to bake it in is to re-encode,
+            # which flattens to mono and drops the immersive metadata.
+            self.showAlert_message_(
+                "Re-encoding graded video",
+                "A color grade or LUT is active. The exported file will be "
+                "re-encoded with the look baked in — which makes it a mono, "
+                "standard (non-immersive) movie.\n\nFor a true lossless immersive "
+                ".aivu, reset the grade and set the LUT to “No LUT”.")
+            suggested = os.path.basename(base + "_graded.mov")
+            allowed = ["mov", "mp4", "m4v"]
+        else:
+            suggested = os.path.basename(base + "_trimmed" + ext)
+            allowed = ["aivu", "mov", "mp4", "m4v"]
 
         panel = NSSavePanel.savePanel()
-        panel.setAllowedFileTypes_(["aivu", "mov", "mp4", "m4v"])
+        panel.setAllowedFileTypes_(allowed)
         panel.setNameFieldStringValue_(suggested)
         panel.setDirectoryURL_(NSURL.fileURLWithPath_(os.path.dirname(self._source_path)))
         if panel.runModal() != 1:
             return
 
         out_path = str(panel.URL().path())
-        self.runExport_start_duration_(out_path, self._in_point, trim_dur)
+        if graded:
+            self.runGradedExport_start_duration_(out_path, self._in_point, trim_dur)
+        else:
+            self.runExport_start_duration_(out_path, self._in_point, trim_dur)
 
     def runExport_start_duration_(self, out_path, start, duration):
         self._beginExportUI_("Exporting lossless .aivu…")
@@ -629,6 +708,68 @@ class AivuTrimmerApp(NSObject):
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
                 "runCallback:", finish, False
             )
+
+        threading.Thread(target=do_export, daemon=True).start()
+
+    def runGradedExport_start_duration_(self, out_path, start, duration):
+        """Re-encode the trimmed range with the grade + LUT baked in (mono,
+        non-immersive) via AVAssetExportSession + the Core Image composition."""
+        self._beginExportUI_("Exporting graded video (re-encode)…")
+        src = self._source_path
+
+        def do_export():
+            from AVFoundation import (
+                AVAssetExportSession, AVAssetExportPresetHEVCHighestQuality,
+                AVAssetExportSessionStatusCompleted,
+            )
+            from CoreMedia import CMTimeRangeMake
+
+            asset = AVAsset.assetWithURL_(NSURL.fileURLWithPath_(src))
+            comp = self.makeProcessingComposition_(asset)
+            out_url = NSURL.fileURLWithPath_(out_path)
+            if os.path.exists(out_path):
+                os.remove(out_path)
+
+            session = AVAssetExportSession.alloc().initWithAsset_presetName_(
+                asset, AVAssetExportPresetHEVCHighestQuality)
+            session.setOutputURL_(out_url)
+            session.setOutputFileType_("com.apple.quicktime-movie")
+            if comp is not None:
+                session.setVideoComposition_(comp)
+            session.setTimeRange_(CMTimeRangeMake(
+                CMTimeMakeWithSeconds(start, 90000),
+                CMTimeMakeWithSeconds(duration, 90000)))
+
+            result_box = [None]
+
+            def on_complete():
+                ok = session.status() == AVAssetExportSessionStatusCompleted
+                err = session.error()
+                result_box[0] = (ok, str(err) if err else "Done.")
+
+            session.exportAsynchronouslyWithCompletionHandler_(on_complete)
+            for _ in range(2400):  # up to 20 min
+                if result_box[0] is not None:
+                    break
+                try:
+                    self.setProgressFraction_(session.progress())
+                except Exception:
+                    pass
+                time.sleep(0.25)
+            self.setProgressFraction_(1.0)
+            ok, msg = result_box[0] if result_box[0] else (False, "Export timed out.")
+
+            def finish():
+                self._endExportUI()
+                if ok:
+                    self.showAlert_message_(
+                        "Graded export complete",
+                        f"Saved graded mono (non-immersive) movie to:\n{out_path}")
+                else:
+                    self.showAlert_message_("Graded export failed", msg[:500])
+
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "runCallback:", finish, False)
 
         threading.Thread(target=do_export, daemon=True).start()
 
@@ -710,12 +851,46 @@ class AivuTrimmerApp(NSObject):
             return self._luts[idx][1]
         return None
 
+    def ffmpegLookFilters(self):
+        """FFmpeg filter strings for the current look: grade (lutrgb) then LUT
+        (lut3d). Empty list if nothing is active."""
+        parts = []
+        expr = ffmpeg_grade_expr(self._grade)
+        if expr:
+            parts.append("lutrgb=r='%s':g='%s':b='%s'" % (expr, expr, expr))
+        lut_path = self.selectedLUTPath()
+        if lut_path:
+            esc = lut_path.replace("\\", "\\\\").replace("'", "\\'")
+            parts.append("lut3d=file='%s'" % esc)
+        return parts
+
+    def processingActive(self):
+        return bool(self.ffmpegLookFilters())
+
     # ------------------------------------------------------------------ #
     #  Live LUT preview (Core Image color cube on the player)             #
     # ------------------------------------------------------------------ #
 
     def lutChanged_(self, sender):
-        self.applyPreviewLUT()
+        self.applyPreviewProcessing()
+
+    def gradeChanged_(self, sender):
+        for name, s in self._sliders.items():
+            v = float(s.doubleValue())
+            self._grade[name] = v
+            lbl = self._slider_vals.get(name)
+            if lbl is not None:
+                lbl.setStringValue_("%.2f" % v)
+        self.applyPreviewProcessing()
+
+    def resetGrade_(self, sender):
+        for name, s in self._sliders.items():
+            s.setDoubleValue_(GRADE_NEUTRAL[name])
+            self._grade[name] = GRADE_NEUTRAL[name]
+            lbl = self._slider_vals.get(name)
+            if lbl is not None:
+                lbl.setStringValue_("%.2f" % GRADE_NEUTRAL[name])
+        self.applyPreviewProcessing()
 
     def loadCube_(self, path):
         """Parse a 3D .cube LUT into (size, NSData of RGBA float32). Cached."""
@@ -760,53 +935,82 @@ class AivuTrimmerApp(NSObject):
         self._cube_cache[path] = result
         return result
 
-    def applyPreviewLUT(self):
-        """Apply (or clear) the selected LUT on the current player item via a
-        Core Image color-cube video composition. Approximate preview only — the
-        export still uses FFmpeg's lut3d for the exact result."""
-        item = self._player_item
-        if item is None:
-            return
+    def buildGradeFilters(self):
+        """Return an ordered list of CIFilters for the current grade (gain ->
+        contrast -> gamma), matching the FFmpeg lutrgb math. Empty if neutral."""
+        filters = []
+        g = self._grade
+        K, C, G = g["gain"], g["contrast"], g["gamma"]
+
+        if abs(K - 1.0) >= 1e-3:
+            m = CIFilter.filterWithName_("CIColorMatrix")
+            from Quartz import CIVector
+            m.setValue_forKey_(CIVector.vectorWithX_Y_Z_W_(K, 0, 0, 0), "inputRVector")
+            m.setValue_forKey_(CIVector.vectorWithX_Y_Z_W_(0, K, 0, 0), "inputGVector")
+            m.setValue_forKey_(CIVector.vectorWithX_Y_Z_W_(0, 0, K, 0), "inputBVector")
+            filters.append(m)
+
+        if abs(C - 1.0) >= 1e-3:
+            cc = CIFilter.filterWithName_("CIColorControls")
+            cc.setValue_forKey_(C, "inputContrast")
+            filters.append(cc)
+
+        if abs(G - 1.0) >= 1e-3:
+            ga = CIFilter.filterWithName_("CIGammaAdjust")
+            ga.setValue_forKey_(1.0 / G, "inputPower")  # ffmpeg gamma G == in^(1/G)
+            filters.append(ga)
+
+        return filters
+
+    def buildProcessingFilters(self):
+        """Full preview/export chain as CIFilters: grade first, then the LUT."""
+        filters = self.buildGradeFilters()
         path = self.selectedLUTPath()
+        if path:
+            cube = self.loadCube_(path)
+            if cube:
+                size, nsdata = cube
+                lut = CIFilter.filterWithName_("CIColorCube")
+                if lut is not None:
+                    lut.setValue_forKey_(size, "inputCubeDimension")
+                    lut.setValue_forKey_(nsdata, "inputCubeData")
+                    filters.append(lut)
+        return filters
 
-        if not path:
-            item.setVideoComposition_(None)
-            return
-
-        cube = self.loadCube_(path)
-        if not cube:
-            item.setVideoComposition_(None)
-            return
-        size, nsdata = cube
-
-        filt = CIFilter.filterWithName_("CIColorCube")
-        if filt is None:
-            item.setVideoComposition_(None)
-            return
-        filt.setValue_forKey_(size, "inputCubeDimension")
-        filt.setValue_forKey_(nsdata, "inputCubeData")
+    def makeProcessingComposition_(self, asset):
+        """Build an AVMutableVideoComposition applying the current grade + LUT
+        (Core Image) to the given asset, or None if nothing is active."""
+        filters = self.buildProcessingFilters()
+        if not filters or asset is None:
+            return None
 
         def handler(request):
             try:
-                src = request.sourceImage()
-                filt.setValue_forKey_(src, "inputImage")
-                out = filt.outputImage()
-                if out is None:
-                    out = src
-                else:
-                    # keep the original extent so geometry is unchanged
-                    out = out.imageByCroppingToRect_(src.extent())
-                request.finishWithImage_context_(out, None)
+                img = request.sourceImage()
+                extent = img.extent()
+                for f in filters:
+                    f.setValue_forKey_(img, "inputImage")
+                    out = f.outputImage()
+                    if out is not None:
+                        img = out
+                img = img.imageByCroppingToRect_(extent)
+                request.finishWithImage_context_(img, None)
             except Exception:
                 request.finishWithImage_context_(request.sourceImage(), None)
 
         try:
-            comp = AVMutableVideoComposition.videoCompositionWithAsset_applyingCIFiltersWithHandler_(
-                self._asset, handler
-            )
-            item.setVideoComposition_(comp)
+            return AVMutableVideoComposition.videoCompositionWithAsset_applyingCIFiltersWithHandler_(
+                asset, handler)
         except Exception:
-            item.setVideoComposition_(None)
+            return None
+
+    def applyPreviewProcessing(self):
+        """Apply the current grade + LUT live on the player. Approximate
+        preview; exports re-render exactly."""
+        item = self._player_item
+        if item is None:
+            return
+        item.setVideoComposition_(self.makeProcessingComposition_(self._asset))
 
     def findFFmpeg(self):
         import shutil
@@ -831,11 +1035,10 @@ class AivuTrimmerApp(NSObject):
         src = self._source_path
 
         # Build the filtergraph: both eye views -> side-by-side -> 8K-wide ->
-        # optional 3D LUT -> 60 fps (frame-drop, no speed change).
+        # optional grade + 3D LUT -> 60 fps (frame-drop, no speed change).
         chain = "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840"
-        if lut_path:
-            esc = lut_path.replace("\\", "\\\\").replace("'", "\\'")
-            chain += ",lut3d=file='%s'" % esc
+        for f in self.ffmpegLookFilters():
+            chain += "," + f
         chain += ",fps=60[v]"
 
         def do_export():
@@ -910,12 +1113,208 @@ class AivuTrimmerApp(NSObject):
         threading.Thread(target=do_export, daemon=True).start()
 
     # ------------------------------------------------------------------ #
+    #  Rectilinear (flat mono 16:9) export via ST-map remap               #
+    # ------------------------------------------------------------------ #
+
+    def exportRectilinear_(self, sender):
+        if not self._source_path:
+            return
+        trim_dur = self._out_point - self._in_point
+        if trim_dur <= 0:
+            self.showAlert_message_("Invalid range", "Out point must be after in point.")
+            return
+
+        ffmpeg = self.findFFmpeg()
+        if not ffmpeg:
+            self.showAlert_message_(
+                "FFmpeg not found",
+                "Rectilinear export needs FFmpeg.\nInstall with:\n"
+                "    conda install -c conda-forge ffmpeg",
+            )
+            return
+
+        # Ensure we have the precomputed remap pixel maps (need the ST map EXR
+        # the first time, to derive them).
+        try:
+            maps = self.ensureRectiMaps()
+        except Exception as e:
+            self.showAlert_message_("Could not build ST map", str(e))
+            return
+
+        if maps is None:
+            # Prompt the user to locate the ST map EXR, then retry.
+            panel = NSOpenPanel.openPanel()
+            panel.setAllowedFileTypes_(["exr"])
+            panel.setTitle_("Locate the immersive ST map (.exr)")
+            if panel.runModal() != 1:
+                return
+            self._stmap_path = str(panel.URL().path())
+            try:
+                maps = self.ensureRectiMaps()
+            except Exception as e:
+                self.showAlert_message_("Could not build ST map", str(e))
+                return
+            if maps is None:
+                return
+
+        base, _ = os.path.splitext(self._source_path)
+        suggested = os.path.basename(base + "_rectilinear_16x9.mp4")
+        panel = NSSavePanel.savePanel()
+        panel.setAllowedFileTypes_(["mp4"])
+        panel.setNameFieldStringValue_(suggested)
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(os.path.dirname(self._source_path)))
+        if panel.runModal() != 1:
+            return
+
+        out_path = str(panel.URL().path())
+        self.runRectiExport_start_duration_ffmpeg_maps_(
+            out_path, self._in_point, trim_dur, ffmpeg, maps)
+
+    def ensureRectiMaps(self):
+        """Return (xmap_png, ymap_png) for the mono left-eye remap, generating
+        them from the ST map EXR (cached) if needed."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        cache = os.path.join(here, "cache")
+        xm = os.path.join(cache, "recti_mono_x.png")
+        ym = os.path.join(cache, "recti_mono_y.png")
+        if os.path.isfile(xm) and os.path.isfile(ym):
+            return (xm, ym)
+
+        exr = self._stmap_path
+        if not exr or not os.path.isfile(exr):
+            return None   # caller will prompt for the EXR
+
+        try:
+            import numpy as np
+            from PIL import Image
+        except ImportError:
+            raise RuntimeError(
+                "Generating the ST map needs numpy + Pillow:\n"
+                "    pip install numpy pillow\n"
+                "(or drop precomputed recti_mono_x.png / _y.png into cache/).")
+
+        ffmpeg = self.findFFmpeg()
+        if not ffmpeg:
+            raise RuntimeError("FFmpeg is required to read the EXR ST map.")
+
+        os.makedirs(cache, exist_ok=True)
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".raw")
+        tmp.close()
+        try:
+            subprocess.run(
+                [ffmpeg, "-hide_banner", "-v", "error", "-i", exr,
+                 "-vf", "format=gbrpf32le", "-f", "rawvideo", tmp.name, "-y"],
+                check=True, capture_output=True)
+            n = os.path.getsize(tmp.name) // 4
+            pixels = n // 3
+            H = int(round((pixels / 2) ** 0.5))   # ST map is 2:1
+            W = 2 * H
+            a = np.fromfile(tmp.name, dtype="<f4").reshape(3, H, W)
+            G, B, R = a[0], a[1], a[2]
+            half = W // 2
+            u = R[:, :half] * 2.0                 # left eye -> [0,1]
+            v = G[:, :half]
+            xmap = np.clip(np.rint(u * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
+            ymap = np.clip(np.rint((1.0 - v) * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
+            Image.fromarray(xmap, mode="I;16").save(xm)
+            Image.fromarray(ymap, mode="I;16").save(ym)
+        finally:
+            try:
+                os.remove(tmp.name)
+            except OSError:
+                pass
+        return (xm, ym)
+
+    def runRectiExport_start_duration_ffmpeg_maps_(self, out_path, start, duration, ffmpeg, maps):
+        xm, ym = maps
+        self._beginExportUI_("Exporting rectilinear 16:9…")
+        src = self._source_path
+
+        # Left eye -> remap (de-fisheye) -> 16:9 crop -> look -> 60 fps.
+        chain = ("[0:v:view:0]scale=%d:%d[e];"
+                 "[e][1][2]remap=format=color:fill=black,"
+                 "crop=%d:%d:0:%d"
+                 % (EYE_SIZE, EYE_SIZE, RECTI_OUT_W, RECTI_OUT_H, RECTI_CROP_Y))
+        for f in self.ffmpegLookFilters():
+            chain += "," + f
+        chain += ",fps=60[o]"
+
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
+            "-progress", "pipe:1", "-y",
+            "-ss", f"{start:.6f}", "-t", f"{duration:.6f}",
+            "-i", src, "-i", xm, "-i", ym,
+            "-filter_complex", chain,
+            "-map", "[o]", "-map", "0:a:0?",
+            "-c:v", "h264_videotoolbox", "-b:v", "24M",
+            "-pix_fmt", "yuv420p", "-tag:v", "avc1",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+
+        def do_export():
+            ok, msg = self.runFFmpeg_duration_(cmd, duration)
+
+            def finish():
+                self._endExportUI()
+                if ok:
+                    self.showAlert_message_(
+                        "Rectilinear export complete",
+                        f"Saved 2048×1152 flat 16:9 (mono) to:\n{out_path}")
+                else:
+                    self.showAlert_message_("Rectilinear export failed", msg[-800:])
+
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "runCallback:", finish, False)
+
+        threading.Thread(target=do_export, daemon=True).start()
+
+    def runFFmpeg_duration_(self, cmd, duration):
+        """Run an ffmpeg command (with -progress pipe:1) updating the progress
+        bar. Returns (ok, message). Call from a background thread."""
+        import tempfile
+        errf = tempfile.NamedTemporaryFile(delete=False, suffix=".log",
+                                           mode="w+", encoding="utf-8")
+        ok, msg = False, "Done."
+        last_pct = -1.0
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, text=True)
+            for line in proc.stdout:
+                line = line.strip()
+                if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
+                    try:
+                        us = int(line.split("=", 1)[1])
+                    except ValueError:
+                        continue
+                    frac = max(0.0, min((us / 1e6) / duration, 1.0))
+                    pct = frac * 100.0
+                    if pct - last_pct >= 0.5:
+                        last_pct = pct
+                        self.setProgressFraction_(frac)
+            proc.wait()
+            ok = proc.returncode == 0 and os.path.exists(cmd[-1])
+            errf.flush(); errf.seek(0)
+            msg = errf.read().strip() or "Done."
+        except Exception as e:
+            ok, msg = False, str(e)
+        finally:
+            try:
+                errf.close(); os.remove(errf.name)
+            except OSError:
+                pass
+        return ok, msg
+
+    # ------------------------------------------------------------------ #
     #  Shared export-UI helpers                                            #
     # ------------------------------------------------------------------ #
 
     def _beginExportUI_(self, status_text):
         self._export_btn.setEnabled_(False)
         self._sbs_btn.setEnabled_(False)
+        if self._recti_btn is not None:
+            self._recti_btn.setEnabled_(False)
         self._status_base = status_text
         self._status_label.setStringValue_(status_text + "  0%")
         self._progress.setIndeterminate_(False)
@@ -930,6 +1329,8 @@ class AivuTrimmerApp(NSObject):
         self._status_label.setStringValue_("")
         self._export_btn.setEnabled_(True)
         self._sbs_btn.setEnabled_(True)
+        if self._recti_btn is not None:
+            self._recti_btn.setEnabled_(True)
 
     def setProgressFraction_(self, frac):
         """Thread-safe: update the determinate progress bar + status percentage."""

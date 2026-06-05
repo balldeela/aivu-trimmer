@@ -3,3 +3,8 @@ pyobjc-framework-Quartz>=10.0
 pyobjc-framework-AVFoundation>=10.0
 pyobjc-framework-AVKit>=10.0
 pyobjc-framework-CoreMedia>=10.0
+
+# Only needed to derive the rectilinear remap maps from the ST map EXR
+# (the first time you run a rectilinear export):
+numpy>=1.21
+Pillow>=9.0

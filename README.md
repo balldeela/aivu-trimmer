@@ -26,9 +26,14 @@ Set in/out points on a visual player with a timecode display, then export.
 - **Side-by-side MP4 export** (Meta Quest 3): decodes both MV-HEVC eye views, packs
   them side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and
   encodes HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
+- **Rectilinear 16:9 export** — de-fisheye the immersive footage into a flat mono
+  16:9 video (H.264) using a Blackmagic immersive **ST map** (EXR). For normal
+  screens / editing.
 - **Color LUT** option — preview a `.cube` 3D LUT live on the player and bake it
-  into the SBS export (e.g. Blackmagic Gen 5 Film → Rec709). See [`luts/`](luts/)
-- **Live progress bar** with percentage during both exports
+  into the MP4 exports (e.g. Blackmagic Gen 5 Film → Rec709). See [`luts/`](luts/)
+- **Contrast / Gamma / Gain** grade controls that update the **preview live** and
+  apply to every export
+- **Live progress bar** with percentage during all exports
 
 ## Requirements
 
@@ -37,12 +42,16 @@ Set in/out points on a visual player with a timecode display, then export.
   exporting `.aivu` will fail.
 - **Python 3.10+**
 - The PyObjC frameworks listed in [`requirements.txt`](requirements.txt)
-- **FFmpeg** (only for the side-by-side MP4 export) with the `hevc_videotoolbox`
-  encoder — the standard macOS builds include it:
+- **FFmpeg** (for the SBS + rectilinear MP4 exports) with the `hevc_videotoolbox` /
+  `h264_videotoolbox` encoders — the standard macOS builds include them:
   ```bash
   conda install -c conda-forge ffmpeg     # or: brew install ffmpeg
   ```
   The lossless `.aivu` export does **not** need FFmpeg.
+- **numpy + Pillow** (only the first time you run a rectilinear export, to derive
+  the remap maps from the ST map EXR): `pip install numpy pillow`
+- An **immersive ST map EXR** for the rectilinear export (Blackmagic provides these
+  for the URSA Cine Immersive). The app prompts for it the first time.
 
 ## Installation
 
@@ -63,9 +72,13 @@ python3 aivu_trimmer.py movie.aivu      # or open a file directly
 2. Scrub the timeline / use the scroll wheel to find your in point, press **Set In**
    (or drag the yellow bar).
 3. Find your out point, press **Set Out** (or drag the red bar).
-4. Export:
-   - **Export .aivu…** for a lossless trimmed Apple Immersive Video, or
-   - **Export SBS MP4 (Quest)…** for a side-by-side stereo clip for Meta Quest 3.
+4. Optionally set a **LUT** and the **Contrast / Gamma / Gain** sliders (the preview
+   updates live).
+5. Export:
+   - **Export .aivu…** — lossless trimmed Apple Immersive Video (or a graded
+     re-encode if a look is active),
+   - **Export SBS MP4 (Quest)…** — side-by-side stereo clip for Meta Quest 3, or
+   - **Export Rectilinear 16:9…** — flat mono 16:9 video for normal screens.
 
 ### Controls
 
@@ -77,9 +90,11 @@ python3 aivu_trimmer.py movie.aivu      # or open a file directly
 | Seek | Click / drag on the timeline |
 | Nudge playhead ±1s | Scroll wheel over the timeline |
 | Zoom preview | **Zoom +** / **Zoom −** / **Fit** buttons |
+| Grade (live) | **Contrast / Gamma / Gain** sliders, **Reset** |
 | Export lossless `.aivu` | **Export .aivu…** button |
 | Export side-by-side MP4 | **Export SBS MP4 (Quest)…** button |
-| Apply a color LUT (SBS only) | **Color LUT** dropdown |
+| Export flat 16:9 video | **Export Rectilinear 16:9…** button |
+| Apply a color LUT | **Color LUT** dropdown |
 
 ## How the lossless `.aivu` trim works
 
@@ -131,12 +146,38 @@ Cine immersive footage (Gen 5 Film color science) to Rec709**.
   empty, falls back to the Gen 5 Rec709 LUTs that ship with **DaVinci Resolve**.
 - The Blackmagic `.cube` files are **not redistributed** in this repo — they're
   Blackmagic's. Install DaVinci Resolve (free) or drop your own LUTs in `luts/`.
-- LUTs apply **only** to the SBS MP4 export. The lossless `.aivu` export copies the
-  original bitstream untouched, so there's nothing to color-transform.
+- LUTs apply to the MP4 exports and the preview.
 
 > **Only apply a Film→Rec709 LUT to log/Film-gamma footage.** If your `.aivu` is
 > already display-ready (graded Rec709), the LUT will double-correct it. Leave the
 > dropdown on **No LUT** when in doubt.
+
+## Contrast / Gamma / Gain
+
+Three sliders apply a simple grade (gain → contrast → gamma) that updates the
+**preview live** and is baked into every export:
+
+- **Preview & graded `.aivu`** use Core Image (`CIColorMatrix` / `CIColorControls`
+  / `CIGammaAdjust`).
+- **SBS & rectilinear MP4** use the equivalent FFmpeg `lutrgb` expression.
+- **Reset** returns all three to neutral (1.00).
+
+When any grade or LUT is active and you hit **Export .aivu…**, the file must be
+**re-encoded** to bake in the look — which flattens it to a **mono, standard
+(non-immersive) movie**. For a true lossless immersive `.aivu`, reset the grade and
+set the LUT to *No LUT*.
+
+## Rectilinear 16:9 export
+
+**Export Rectilinear 16:9…** de-fisheyes the immersive footage into a flat **mono
+16:9** video (2048×1152, H.264) for normal screens or an editing timeline.
+
+- It remaps the left eye through an **ST map** (an EXR that, per output pixel,
+  encodes which source UV to sample) via FFmpeg's `remap` filter, then crops to 16:9.
+- The first time, the app asks for the ST map `.exr` (Blackmagic provides these for
+  the URSA Cine Immersive) and derives 16-bit pixel maps from it, cached in
+  `cache/` (regenerated automatically; not committed).
+- Any active grade / LUT is baked in.
 
 ## License
 
