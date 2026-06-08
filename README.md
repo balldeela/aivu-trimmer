@@ -23,9 +23,10 @@ Set in/out points on a visual player with a timecode display, then export.
 - **Zoom in/out** of the preview to inspect detail
 - **Lossless `.aivu` export** using `AVAssetExportSession` with passthrough — writes
   a real `.aivu` that opens in Apple Immersive Video Utility
-- **Side-by-side MP4 export** (Meta Quest 3): decodes both MV-HEVC eye views, packs
-  them side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and
-  encodes HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
+- **VR180 side-by-side MP4 export** (Meta Quest 3): decodes both MV-HEVC eye views,
+  **reprojects each from Apple's lens projection into equirectangular**, packs them
+  side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and encodes
+  HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
 - **Rectilinear 16:9 export** — de-fisheye the immersive footage into a flat mono
   16:9 video (H.264) using a Blackmagic immersive **ST map** (EXR). For normal
   screens / editing.
@@ -107,26 +108,33 @@ AIVU boxes, so the result opens correctly in Apple Immersive Video Utility.
 > output snaps to the nearest keyframe in the source. Your exact in point may shift
 > by up to one GOP interval. Avoiding this would require re-encoding.
 
-## How the side-by-side MP4 export works
+## How the side-by-side MP4 export works (VR180 equirectangular)
 
-For Meta Quest 3 the app re-encodes the trimmed range with FFmpeg:
+Apple Immersive Video stores each eye in a **parametric lens projection**, not
+equirectangular. Quest's "180° / side-by-side" player modes assume **equirectangular
+VR180** — so simply stacking the two eyes renders with the wrong geometry
+(over-wide FOV, curved horizons, off convergence). The export therefore **reprojects
+each eye into equirectangular** using an ST map before packing:
 
 ```
-ffmpeg -ss <in> -t <dur> -i input.aivu \
-  -filter_complex "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840,fps=60[v]" \
+ffmpeg -ss <in> -t <dur> -i input.aivu -i sbs_equirect_x.png -i sbs_equirect_y.png \
+  -filter_complex "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=8640:4320[s];\
+                   [s][1][2]remap=format=color:fill=black,fps=60[v]" \
   -map "[v]" -map "0:a:0?" \
   -c:v hevc_videotoolbox -b:v 60M -tag:v hvc1 -c:a aac -b:a 192k \
-  -movflags +faststart output_SBS_60fps.mp4
+  -movflags +faststart output_VR180_SBS_60fps.mp4
 ```
 
-- Both MV-HEVC eye views are decoded (`view:0` / `view:1`) and placed
-  **side-by-side** (left eye | right eye).
-- Output is **7680×3840** — under the Quest 3's HEVC decode ceiling. (Full-res SBS
-  would be 8640 px wide, beyond HEVC's 8192 limit, so it's scaled to 8K width.)
-- The `fps=60` filter resamples 90→60 fps **by timestamp**, i.e. it drops frames
-  without altering playback speed.
-- Encoded as HEVC (H.265) — H.264 can't exceed 4096 px, so it isn't an option at
-  this resolution.
+- Both MV-HEVC eye views are decoded (`view:0` / `view:1`) and hstacked.
+- FFmpeg's `remap` reprojects **Apple lens projection → equirectangular** per eye,
+  driven by 16-bit pixel maps derived from the **ST map** EXR (same map as the
+  rectilinear export). Output is **7680×3840** (per eye 3840 = 180°×180°).
+- The `fps=60` filter resamples 90→60 fps **by timestamp** (drops frames, no speed
+  change).
+- Encoded as HEVC (H.265) — H.264 can't exceed 4096 px.
+
+> The SBS export now needs the **ST map EXR** (it prompts the first time, same as the
+> rectilinear export) and **numpy + Pillow** to derive the maps.
 
 On the Quest 3, copy the `.mp4` over and open it in a VR video player
 (DeoVR, Skybox, etc.), then select a **side-by-side / 180° stereo** viewing mode to
@@ -173,17 +181,22 @@ proceed:
 The grade/LUT still always affect the SBS and rectilinear MP4 exports and the
 preview.
 
-## Rectilinear 16:9 export
+## Flat 16:9 export
 
-**Export Rectilinear 16:9…** de-fisheyes the immersive footage into a flat **mono
-16:9** video (2048×1152, H.264) for normal screens or an editing timeline.
+**Export Rectilinear 16:9…** produces a flat **mono 16:9** video (2048×1152, H.264)
+for normal screens or an editing timeline.
 
-- It remaps the left eye through an **ST map** (an EXR that, per output pixel,
-  encodes which source UV to sample) via FFmpeg's `remap` filter, then crops to 16:9.
+- It reprojects the left eye through the **ST map** (Apple lens → equirectangular)
+  via FFmpeg's `remap`, then centre-crops to 16:9.
 - The first time, the app asks for the ST map `.exr` (Blackmagic provides these for
   the URSA Cine Immersive) and derives 16-bit pixel maps from it, cached in
   `cache/` (regenerated automatically; not committed).
 - Any active grade / LUT is baked in.
+
+> **Caveat:** this is a centre crop of the *equirectangular* reprojection, so it's a
+> flat-ish view with mild residual curvature toward the edges — not a true gnomonic
+> (perfectly rectilinear) projection. Fine for review/centre framing; a proper
+> rectilinear crop is a possible future addition.
 
 ## License
 

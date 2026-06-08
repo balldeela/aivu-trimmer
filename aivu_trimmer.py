@@ -41,12 +41,16 @@ from CoreMedia import CMTimeMakeWithSeconds, CMTimeGetSeconds, kCMTimeZero
 
 ASSUMED_FPS = 45.0
 
-# Rectilinear (mono) export geometry, derived from the stereoscopic ST map.
+# Geometry derived from the stereoscopic ST map (Apple lens -> equirectangular).
 EYE_SIZE = 4320          # source single-eye square the ST map was authored for
 RECTI_SQUARE = 2048      # remap output (per eye) before cropping
 RECTI_OUT_W = 2048
 RECTI_OUT_H = 1152       # 16:9 crop of the square
 RECTI_CROP_Y = (RECTI_SQUARE - RECTI_OUT_H) // 2
+
+# VR180 equirectangular side-by-side export (Meta Quest 3).
+SBS_SRC_W, SBS_SRC_H = 8640, 4320   # decoded left|right eyes, hstacked
+SBS_OUT_W, SBS_OUT_H = 7680, 3840   # equirect output (per eye 3840 = 180°×180°)
 
 # Default location of the Blackmagic immersive ST map EXR (user-provided).
 DEFAULT_STMAP = os.path.expanduser(
@@ -806,8 +810,14 @@ class AivuTrimmerApp(NSObject):
             )
             return
 
+        # Resolve the equirectangular reprojection maps (prompts for the ST map
+        # EXR the first time). VR180 needs the lens -> equirectangular reprojection.
+        maps = self.resolveMaps_("sbs")
+        if maps is None:
+            return
+
         base, _ = os.path.splitext(self._source_path)
-        suggested = os.path.basename(base + "_SBS_60fps.mp4")
+        suggested = os.path.basename(base + "_VR180_SBS_60fps.mp4")
 
         panel = NSSavePanel.savePanel()
         panel.setAllowedFileTypes_(["mp4"])
@@ -817,7 +827,8 @@ class AivuTrimmerApp(NSObject):
             return
 
         out_path = str(panel.URL().path())
-        self.runSBSExport_start_duration_ffmpeg_(out_path, self._in_point, trim_dur, ffmpeg)
+        self.runSBSExport_start_duration_ffmpeg_maps_(
+            out_path, self._in_point, trim_dur, ffmpeg, maps)
 
     def discoverLUTs(self):
         """Return [(label, path|None)] — 'No LUT' first, then discovered .cube files.
@@ -1039,86 +1050,51 @@ class AivuTrimmerApp(NSObject):
                 return c
         return None
 
-    def runSBSExport_start_duration_ffmpeg_(self, out_path, start, duration, ffmpeg):
+    def runSBSExport_start_duration_ffmpeg_maps_(self, out_path, start, duration, ffmpeg, maps):
+        xm, ym = maps
         lut_path = self.selectedLUTPath()
-        self._beginExportUI_("Exporting side-by-side MP4…")
+        self._beginExportUI_("Exporting VR180 side-by-side MP4…")
         src = self._source_path
 
-        # Build the filtergraph: both eye views -> side-by-side -> 8K-wide ->
-        # optional grade + 3D LUT -> 60 fps (frame-drop, no speed change).
-        chain = "[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=7680:3840"
+        # Decode both eye views -> hstack -> REPROJECT (Apple lens -> VR180
+        # equirectangular) via the ST map -> optional grade/LUT -> 60 fps.
+        chain = ("[0:v:view:0][0:v:view:1]hstack=inputs=2,scale=%d:%d[s];"
+                 "[s][1][2]remap=format=color:fill=black"
+                 % (SBS_SRC_W, SBS_SRC_H))
         for f in self.ffmpegLookFilters():
             chain += "," + f
         chain += ",fps=60[v]"
 
+        cmd = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
+            "-progress", "pipe:1", "-y",
+            "-ss", f"{start:.6f}", "-t", f"{duration:.6f}",
+            "-i", src, "-i", xm, "-i", ym,
+            "-filter_complex", chain,
+            "-map", "[v]", "-map", "0:a:0?",
+            "-c:v", "hevc_videotoolbox", "-b:v", "60M", "-tag:v", "hvc1",
+            "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+
         def do_export():
-            import tempfile
-            if os.path.exists(out_path):
-                try:
-                    os.remove(out_path)
-                except OSError:
-                    pass
-
-            cmd = [
-                ffmpeg, "-hide_banner", "-loglevel", "error", "-nostats",
-                "-progress", "pipe:1", "-y",
-                "-ss", f"{start:.6f}", "-t", f"{duration:.6f}",
-                "-i", src,
-                "-filter_complex", chain,
-                "-map", "[v]", "-map", "0:a:0?",
-                "-c:v", "hevc_videotoolbox", "-b:v", "60M", "-tag:v", "hvc1",
-                "-c:a", "aac", "-b:a", "192k",
-                "-movflags", "+faststart",
-                out_path,
-            ]
-
-            errf = tempfile.NamedTemporaryFile(delete=False, suffix=".log",
-                                               mode="w+", encoding="utf-8")
-            ok, msg = False, "Done."
-            last_pct = -1.0
-            try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf,
-                                        text=True)
-                for line in proc.stdout:
-                    line = line.strip()
-                    if line.startswith("out_time_us=") or line.startswith("out_time_ms="):
-                        val = line.split("=", 1)[1]
-                        try:
-                            us = int(val)
-                        except ValueError:
-                            continue
-                        frac = max(0.0, min((us / 1e6) / duration, 1.0))
-                        pct = frac * 100.0
-                        if pct - last_pct >= 0.5:   # throttle UI updates
-                            last_pct = pct
-                            self.setProgressFraction_(frac)
-                proc.wait()
-                ok = proc.returncode == 0 and os.path.exists(out_path)
-                errf.flush(); errf.seek(0)
-                err_text = errf.read().strip()
-                msg = err_text or "Done."
-            except Exception as e:
-                ok, msg = False, str(e)
-            finally:
-                try:
-                    errf.close(); os.remove(errf.name)
-                except OSError:
-                    pass
+            ok, msg = self.runFFmpeg_duration_(cmd, duration)
 
             def finish():
                 self._endExportUI()
                 if ok:
                     extra = ("\nLUT: %s" % os.path.basename(lut_path)) if lut_path else ""
                     self.showAlert_message_(
-                        "SBS MP4 export complete",
-                        f"Saved 7680×3840 side-by-side HEVC at 60 fps to:\n{out_path}{extra}",
-                    )
+                        "VR180 SBS export complete",
+                        "Saved 7680×3840 equirectangular side-by-side (VR180) HEVC "
+                        f"at 60 fps to:\n{out_path}{extra}\n\nOn Quest, open it and "
+                        "choose the 180° / side-by-side viewing mode.")
                 else:
                     self.showAlert_message_("SBS export failed", msg[-800:])
 
             self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                "runCallback:", finish, False
-            )
+                "runCallback:", finish, False)
 
         threading.Thread(target=do_export, daemon=True).start()
 
@@ -1143,29 +1119,9 @@ class AivuTrimmerApp(NSObject):
             )
             return
 
-        # Ensure we have the precomputed remap pixel maps (need the ST map EXR
-        # the first time, to derive them).
-        try:
-            maps = self.ensureRectiMaps()
-        except Exception as e:
-            self.showAlert_message_("Could not build ST map", str(e))
-            return
-
+        maps = self.resolveMaps_("recti")
         if maps is None:
-            # Prompt the user to locate the ST map EXR, then retry.
-            panel = NSOpenPanel.openPanel()
-            panel.setAllowedFileTypes_(["exr"])
-            panel.setTitle_("Locate the immersive ST map (.exr)")
-            if panel.runModal() != 1:
-                return
-            self._stmap_path = str(panel.URL().path())
-            try:
-                maps = self.ensureRectiMaps()
-            except Exception as e:
-                self.showAlert_message_("Could not build ST map", str(e))
-                return
-            if maps is None:
-                return
+            return
 
         base, _ = os.path.splitext(self._source_path)
         suggested = os.path.basename(base + "_rectilinear_16x9.mp4")
@@ -1180,34 +1136,24 @@ class AivuTrimmerApp(NSObject):
         self.runRectiExport_start_duration_ffmpeg_maps_(
             out_path, self._in_point, trim_dur, ffmpeg, maps)
 
-    def ensureRectiMaps(self):
-        """Return (xmap_png, ymap_png) for the mono left-eye remap, generating
-        them from the ST map EXR (cached) if needed."""
-        here = os.path.dirname(os.path.abspath(__file__))
-        cache = os.path.join(here, "cache")
-        xm = os.path.join(cache, "recti_mono_x.png")
-        ym = os.path.join(cache, "recti_mono_y.png")
-        if os.path.isfile(xm) and os.path.isfile(ym):
-            return (xm, ym)
+    def cacheDir(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
+    def loadStMapUV(self):
+        """Read the ST map EXR into (R, G, W, H) float arrays (R=u, G=v).
+        Returns None if no EXR is set; raises RuntimeError on missing tools."""
         exr = self._stmap_path
         if not exr or not os.path.isfile(exr):
-            return None   # caller will prompt for the EXR
-
+            return None
         try:
             import numpy as np
-            from PIL import Image
         except ImportError:
             raise RuntimeError(
                 "Generating the ST map needs numpy + Pillow:\n"
-                "    pip install numpy pillow\n"
-                "(or drop precomputed recti_mono_x.png / _y.png into cache/).")
-
+                "    pip install numpy pillow")
         ffmpeg = self.findFFmpeg()
         if not ffmpeg:
             raise RuntimeError("FFmpeg is required to read the EXR ST map.")
-
-        os.makedirs(cache, exist_ok=True)
         import tempfile
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".raw")
         tmp.close()
@@ -1221,20 +1167,87 @@ class AivuTrimmerApp(NSObject):
             H = int(round((pixels / 2) ** 0.5))   # ST map is 2:1
             W = 2 * H
             a = np.fromfile(tmp.name, dtype="<f4").reshape(3, H, W)
-            G, B, R = a[0], a[1], a[2]
-            half = W // 2
-            u = R[:, :half] * 2.0                 # left eye -> [0,1]
-            v = G[:, :half]
-            xmap = np.clip(np.rint(u * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
-            ymap = np.clip(np.rint((1.0 - v) * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
-            Image.fromarray(xmap, mode="I;16").save(xm)
-            Image.fromarray(ymap, mode="I;16").save(ym)
+            return a[2].copy(), a[0].copy(), W, H   # R(=u), G(=v), W, H
         finally:
             try:
                 os.remove(tmp.name)
             except OSError:
                 pass
+
+    def ensureRectiMaps(self):
+        """(xmap, ymap) PNGs for the mono left-eye rectilinear-crop remap."""
+        cache = self.cacheDir()
+        xm = os.path.join(cache, "recti_mono_x.png")
+        ym = os.path.join(cache, "recti_mono_y.png")
+        if os.path.isfile(xm) and os.path.isfile(ym):
+            return (xm, ym)
+        uv = self.loadStMapUV()
+        if uv is None:
+            return None
+        import numpy as np
+        from PIL import Image
+        R, G, W, H = uv
+        half = W // 2
+        u = R[:, :half] * 2.0                       # left eye -> [0,1]
+        v = G[:, :half]
+        xmap = np.clip(np.rint(u * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
+        ymap = np.clip(np.rint((1.0 - v) * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
+        os.makedirs(cache, exist_ok=True)
+        Image.fromarray(xmap, mode="I;16").save(xm)
+        Image.fromarray(ymap, mode="I;16").save(ym)
         return (xm, ym)
+
+    def ensureSBSMaps(self):
+        """(xmap, ymap) PNGs that reproject the hstacked left|right eyes from
+        Apple's lens projection into a VR180 equirectangular side-by-side frame.
+        Output 7680×3840 (per eye 3840 = 180°×180°)."""
+        cache = self.cacheDir()
+        xm = os.path.join(cache, "sbs_equirect_x.png")
+        ym = os.path.join(cache, "sbs_equirect_y.png")
+        if os.path.isfile(xm) and os.path.isfile(ym):
+            return (xm, ym)
+        uv = self.loadStMapUV()
+        if uv is None:
+            return None
+        import numpy as np
+        from PIL import Image
+        R, G, W, H = uv
+        # Upsample the (smooth) UV map to the output resolution.
+        def up(ch):
+            im = Image.fromarray(ch.astype(np.float32), mode="F").resize(
+                (SBS_OUT_W, SBS_OUT_H), Image.BICUBIC)
+            return np.asarray(im, dtype=np.float32)
+        u = up(R)
+        v = up(G)
+        xmap = np.clip(np.rint(u * (SBS_SRC_W - 1)), 0, SBS_SRC_W - 1).astype(np.uint16)
+        ymap = np.clip(np.rint((1.0 - v) * (SBS_SRC_H - 1)), 0, SBS_SRC_H - 1).astype(np.uint16)
+        os.makedirs(cache, exist_ok=True)
+        Image.fromarray(xmap, mode="I;16").save(xm)
+        Image.fromarray(ymap, mode="I;16").save(ym)
+        return (xm, ym)
+
+    def resolveMaps_(self, which):
+        """Return map paths for 'recti' or 'sbs', prompting for the ST map EXR
+        if it's not yet known. Returns None if the user cancels."""
+        gen = self.ensureSBSMaps if which == "sbs" else self.ensureRectiMaps
+        try:
+            maps = gen()
+        except Exception as e:
+            self.showAlert_message_("Could not build ST map", str(e))
+            return None
+        if maps is not None:
+            return maps
+        panel = NSOpenPanel.openPanel()
+        panel.setAllowedFileTypes_(["exr"])
+        panel.setTitle_("Locate the immersive ST map (.exr)")
+        if panel.runModal() != 1:
+            return None
+        self._stmap_path = str(panel.URL().path())
+        try:
+            return gen()
+        except Exception as e:
+            self.showAlert_message_("Could not build ST map", str(e))
+            return None
 
     def runRectiExport_start_duration_ffmpeg_maps_(self, out_path, start, duration, ffmpeg, maps):
         xm, ym = maps
