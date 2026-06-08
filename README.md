@@ -27,8 +27,8 @@ Set in/out points on a visual player with a timecode display, then export.
   **reprojects each from Apple's lens projection into equirectangular**, packs them
   side-by-side at 7680×3840, drops 90→60 fps **without changing speed**, and encodes
   HEVC with Apple's hardware encoder (`hevc_videotoolbox`)
-- **Rectilinear 16:9 export** — de-fisheye the immersive footage into a flat mono
-  16:9 video (H.264) using a Blackmagic immersive **ST map** (EXR). For normal
+- **Rectilinear 16:9 export** — a true **gnomonic** flat mono 16:9 video (H.264) of
+  the immersive footage (perspective reprojection via the **ST map**). For normal
   screens / editing.
 - **Color LUT** option — preview a `.cube` 3D LUT live on the player and bake it
   into the MP4 exports (e.g. Blackmagic Gen 5 Film → Rec709). See [`luts/`](luts/)
@@ -181,22 +181,20 @@ proceed:
 The grade/LUT still always affect the SBS and rectilinear MP4 exports and the
 preview.
 
-## Flat 16:9 export
+## Rectilinear (flat 16:9) export
 
-**Export Rectilinear 16:9…** produces a flat **mono 16:9** video (2048×1152, H.264)
-for normal screens or an editing timeline.
+**Export Rectilinear 16:9…** produces a true **gnomonic** flat **mono 16:9** video
+(1920×1080, H.264, 90° horizontal FOV) for normal screens or an editing timeline —
+straight lines stay straight.
 
-- It reprojects the left eye through the **ST map** (Apple lens → equirectangular)
-  via FFmpeg's `remap`, then centre-crops to 16:9.
+- The pixel maps compose a **perspective (gnomonic) projection** with the ST map's
+  equirectangular UV: each output pixel casts a camera ray → spherical angle →
+  equirectangular position → the ST map's source UV. So it reprojects all the way
+  from Apple's lens projection to a flat rectilinear view (not a crop of equirect).
 - The first time, the app asks for the ST map `.exr` (Blackmagic provides these for
-  the URSA Cine Immersive) and derives 16-bit pixel maps from it, cached in
-  `cache/` (regenerated automatically; not committed).
-- Any active grade / LUT is baked in.
-
-> **Caveat:** this is a centre crop of the *equirectangular* reprojection, so it's a
-> flat-ish view with mild residual curvature toward the edges — not a true gnomonic
-> (perfectly rectilinear) projection. Fine for review/centre framing; a proper
-> rectilinear crop is a possible future addition.
+  the URSA Cine Immersive) and caches the derived 16-bit maps in `cache/`
+  (regenerated automatically; not committed).
+- The FOV is set by `RECTI_HFOV_DEG` (default 90°). Any active grade / LUT is baked in.
 
 ## License
 

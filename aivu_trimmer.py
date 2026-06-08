@@ -43,10 +43,11 @@ ASSUMED_FPS = 45.0
 
 # Geometry derived from the stereoscopic ST map (Apple lens -> equirectangular).
 EYE_SIZE = 4320          # source single-eye square the ST map was authored for
-RECTI_SQUARE = 2048      # remap output (per eye) before cropping
-RECTI_OUT_W = 2048
-RECTI_OUT_H = 1152       # 16:9 crop of the square
-RECTI_CROP_Y = (RECTI_SQUARE - RECTI_OUT_H) // 2
+
+# Flat rectilinear (gnomonic) export: a true perspective view of the left eye.
+RECTI_OUT_W = 1920
+RECTI_OUT_H = 1080       # 16:9
+RECTI_HFOV_DEG = 90.0    # horizontal field of view of the flat view
 
 # VR180 equirectangular side-by-side export (Meta Quest 3).
 SBS_SRC_W, SBS_SRC_H = 8640, 4320   # decoded left|right eyes, hstacked
@@ -1175,10 +1176,12 @@ class AivuTrimmerApp(NSObject):
                 pass
 
     def ensureRectiMaps(self):
-        """(xmap, ymap) PNGs for the mono left-eye rectilinear-crop remap."""
+        """(xmap, ymap) PNGs for a true gnomonic (rectilinear) view of the left
+        eye. Composes a perspective projection with the ST map's equirectangular
+        UV so straight lines stay straight."""
         cache = self.cacheDir()
-        xm = os.path.join(cache, "recti_mono_x.png")
-        ym = os.path.join(cache, "recti_mono_y.png")
+        xm = os.path.join(cache, "recti_gnomonic_x.png")
+        ym = os.path.join(cache, "recti_gnomonic_y.png")
         if os.path.isfile(xm) and os.path.isfile(ym):
             return (xm, ym)
         uv = self.loadStMapUV()
@@ -1188,8 +1191,33 @@ class AivuTrimmerApp(NSObject):
         from PIL import Image
         R, G, W, H = uv
         half = W // 2
-        u = R[:, :half] * 2.0                       # left eye -> [0,1]
-        v = G[:, :half]
+        Ru = R[:, :half]          # left-eye u (full-SBS coords, ~[0,0.5])
+        Gv = G[:, :half]          # left-eye v ([0,1])
+
+        OW, OH = RECTI_OUT_W, RECTI_OUT_H
+        # Perspective rays for each output pixel (z forward, y up).
+        xnd, ynd = np.meshgrid((np.arange(OW) + 0.5) / OW * 2 - 1,
+                               (np.arange(OH) + 0.5) / OH * 2 - 1)
+        t = np.tan(np.deg2rad(RECTI_HFOV_DEG) / 2.0)
+        dx = xnd * t
+        dy = -ynd * t * (OH / OW)          # square pixels -> vfov from aspect
+        dz = np.ones_like(dx)
+        theta = np.arctan2(dx, dz)                          # longitude
+        phi = np.arctan2(dy, np.sqrt(dx * dx + dz * dz))    # latitude
+
+        # Equirectangular position within the eye (linear in angle over ±90°).
+        ex = np.clip((theta / np.pi + 0.5) * (half - 1), 0, half - 1)
+        ey = np.clip((0.5 - phi / np.pi) * (H - 1), 0, H - 1)
+        x0 = np.floor(ex).astype(int); y0 = np.floor(ey).astype(int)
+        x1 = np.minimum(x0 + 1, half - 1); y1 = np.minimum(y0 + 1, H - 1)
+        wx = ex - x0; wy = ey - y0
+
+        def sample(M):
+            return (M[y0, x0] * (1 - wx) * (1 - wy) + M[y0, x1] * wx * (1 - wy) +
+                    M[y1, x0] * (1 - wx) * wy + M[y1, x1] * wx * wy)
+
+        u = sample(Ru) * 2.0               # eye-local [0,1]
+        v = sample(Gv)
         xmap = np.clip(np.rint(u * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
         ymap = np.clip(np.rint((1.0 - v) * (EYE_SIZE - 1)), 0, EYE_SIZE - 1).astype(np.uint16)
         os.makedirs(cache, exist_ok=True)
@@ -1254,11 +1282,11 @@ class AivuTrimmerApp(NSObject):
         self._beginExportUI_("Exporting rectilinear 16:9…")
         src = self._source_path
 
-        # Left eye -> remap (de-fisheye) -> 16:9 crop -> look -> 60 fps.
+        # Left eye -> gnomonic remap (true rectilinear, already 16:9) -> look
+        # -> 60 fps. The maps' resolution defines the output size.
         chain = ("[0:v:view:0]scale=%d:%d[e];"
-                 "[e][1][2]remap=format=color:fill=black,"
-                 "crop=%d:%d:0:%d"
-                 % (EYE_SIZE, EYE_SIZE, RECTI_OUT_W, RECTI_OUT_H, RECTI_CROP_Y))
+                 "[e][1][2]remap=format=color:fill=black"
+                 % (EYE_SIZE, EYE_SIZE))
         for f in self.ffmpegLookFilters():
             chain += "," + f
         chain += ",fps=60[o]"
@@ -1285,7 +1313,8 @@ class AivuTrimmerApp(NSObject):
                 if ok:
                     self.showAlert_message_(
                         "Rectilinear export complete",
-                        f"Saved 2048×1152 flat 16:9 (mono) to:\n{out_path}")
+                        f"Saved {RECTI_OUT_W}×{RECTI_OUT_H} flat 16:9 rectilinear "
+                        f"(mono, {int(RECTI_HFOV_DEG)}° FOV) to:\n{out_path}")
                 else:
                     self.showAlert_message_("Rectilinear export failed", msg[-800:])
 
